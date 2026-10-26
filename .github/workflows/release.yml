@@ -1,0 +1,163 @@
+# Release: pushing a tag v* builds the binaries with the tag as version and publishes a GitHub
+# Release with every asset install.sh and uninstall.sh need, plus checksums.txt covering all of them.
+# Tags with a pre-release suffix (v0.1.0-rc.1) become pre-releases, which /releases/latest skips.
+# Actions are pinned by commit SHA; the comment after each pin is the release tag.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash # -eo pipefail, which the default shell lacks
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write # create the release and upload its assets
+    env:
+      TAG: ${{ github.ref_name }}
+    steps:
+      # Semver with a "v" prefix. Build metadata (+...) is refused: the tag is part of the
+      # download URLs install.sh builds, and semver ignores it when comparing versions anyway.
+      - name: Check the tag
+        id: tag
+        run: |
+          num='(0|[1-9][0-9]*)'
+          ident='(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)'
+          if [[ ! $TAG =~ ^v$num\.$num\.$num(-$ident(\.$ident)*)?$ ]]; then
+            echo "::error::tag $TAG is not a semver release tag (v1.2.3 or v1.2.3-rc.1)"
+            exit 1
+          fi
+          prerelease=false
+          [[ $TAG == *-* ]] && prerelease=true
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+          echo "$TAG: prerelease=$prerelease"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # the release notes need the previous tag and the commits since
+          persist-credentials: false
+
+      # scripts/build.sh is the single place where the Go version is pinned.
+      - name: Read pinned Go version
+        id: pins
+        run: echo "go=$(sed -n 's/^GO_VERSION=//p' scripts/build.sh)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ steps.pins.outputs.go }}
+          cache: false # a release is built from a clean module cache
+
+      - name: Build linux/amd64 and linux/arm64
+        run: VERSION="$TAG" scripts/build.sh
+
+      # Both binaries come from the same ocb run with the same dist.version; the one for the
+      # runner's architecture is executed. It prints "logember-agent version 0.1.0-rc.1".
+      - name: Check the version the binary reports
+        run: |
+          agent="dist/logember-agent_linux_$(dpkg --print-architecture)"
+          out=$("$agent" --version)
+          echo "$out"
+          reported="v${out##* }"
+          if [[ $reported != "$TAG" ]]; then
+            echo "::error::the binary reports $reported, the tag is $TAG"
+            exit 1
+          fi
+
+      - name: logember-agent validate
+        env:
+          LOGEMBER_ENV: ci
+          LOGEMBER_INGEST_URL: https://ingest.invalid
+          LOGEMBER_INGEST_KEY: dummy
+        run: |
+          agent="dist/logember-agent_linux_$(dpkg --print-architecture)"
+          "$agent" validate --config config/agent.yaml
+
+      # Flat asset names: install.sh downloads <base>/download/<tag>/<asset>.
+      - name: Collect assets and write checksums.txt
+        run: |
+          mkdir -p "$RUNNER_TEMP/release"
+          for f in dist/logember-agent_linux_amd64 dist/logember-agent_linux_arm64 \
+            config/agent.yaml config/redaction.yaml deploy/logember-agent.service \
+            install.sh uninstall.sh; do
+            [[ -f $f ]] || { echo "::error::$f is missing; every release needs it"; exit 1; }
+            cp "$f" "$RUNNER_TEMP/release/"
+          done
+          cd "$RUNNER_TEMP/release"
+          chmod 0755 logember-agent_linux_* install.sh uninstall.sh
+          sha256sum -- * > checksums.txt
+          sha256sum -c checksums.txt
+          cat checksums.txt
+
+      # Commits since the previous tag that is an ancestor of this one. A final release is
+      # compared with the previous final release, so its notes also cover its pre-releases.
+      - name: Write release notes
+        env:
+          PRERELEASE: ${{ steps.tag.outputs.prerelease }}
+          REPO: ${{ github.repository }}
+        run: |
+          exclude=()
+          [[ $PRERELEASE == true ]] || exclude=(--exclude 'v*-*')
+          prev=$(git describe --tags --abbrev=0 --match 'v*' ${exclude[@]+"${exclude[@]}"} "$TAG^" 2>/dev/null) || prev=""
+          range=$TAG
+          [[ -n $prev ]] && range="$prev..$TAG"
+          {
+            echo "## Changes"
+            echo
+            git log --no-merges --format='- %s (%h)' "$range"
+            if [[ -n $prev ]]; then
+              echo
+              echo "Full changelog: https://github.com/$REPO/compare/$prev...$TAG"
+            fi
+            echo
+            echo "## Install"
+            echo
+            echo '```sh'
+            echo "curl -fsSL https://github.com/$REPO/releases/download/$TAG/install.sh | sudo bash -s -- --token <ENROLLMENT_TOKEN> --version $TAG"
+            echo '```'
+            echo
+            echo "Every asset is listed in checksums.txt; check a manual download with \`sha256sum -c checksums.txt\`."
+          } > "$RUNNER_TEMP/notes.md"
+          cat "$RUNNER_TEMP/notes.md"
+
+      # Created as a draft and published only once every asset is uploaded, so nobody (and no
+      # /releases/latest download) sees a release with assets missing.
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PRERELEASE: ${{ steps.tag.outputs.prerelease }}
+        run: |
+          if [[ $PRERELEASE == true ]]; then
+            flags=(--prerelease --latest=false)
+          else
+            flags=(--latest)
+          fi
+          gh release create "$TAG" --verify-tag --draft --title "$TAG" \
+            --notes-file "$RUNNER_TEMP/notes.md" "${flags[@]}" "$RUNNER_TEMP"/release/*
+          gh release edit "$TAG" --draft=false "${flags[@]}"
+
+      # What install.sh does: download from the public URLs and check against checksums.txt.
+      - name: Check the published assets
+        env:
+          REPO: ${{ github.repository }}
+        run: |
+          dir=$(mktemp -d)
+          cd "$dir"
+          base="https://github.com/$REPO/releases/download/$TAG"
+          curl -fsSL --retry 5 --retry-all-errors -O "$base/checksums.txt"
+          while read -r _ name; do
+            curl -fsSL --retry 5 --retry-all-errors -O "$base/$name"
+          done < checksums.txt
+          sha256sum -c checksums.txt
