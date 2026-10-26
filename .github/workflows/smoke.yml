@@ -1,0 +1,163 @@
+# Smoke test: a real install on Ubuntu 24.04 and Debian 12, amd64 and arm64, and the first lines
+# arriving. test/smoke/run.sh does the work; the mock hub and the OTLP sink run next to the host.
+#   pull requests touching the installer, config or build  binaries built from the PR
+#   after the Release workflow                             the published release, as a user gets it
+#   manually                                               a release tag, or empty: a build of the ref
+# Target "staging" (the real staging hub/ingest) is a stub for now.
+# Actions are pinned by commit SHA; the comment after each pin is the release tag.
+name: Smoke
+
+on:
+  pull_request:
+    paths:
+      - install.sh
+      - uninstall.sh
+      - config/**
+      - deploy/**
+      - builder-config.yaml
+      - scripts/build.sh
+      - test/smoke/**
+      - .github/workflows/smoke.yml
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release tag to test, e.g. v0.1.0-rc.1 (empty builds the selected ref)
+        required: false
+        default: ''
+      target:
+        description: mock (mock hub + OTLP sink) or staging (not set up yet)
+        type: choice
+        options: [mock, staging]
+        default: mock
+
+permissions:
+  contents: read
+
+concurrency:
+  group: smoke-${{ github.event.workflow_run.head_branch || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: bash # -eo pipefail, which the default shell lacks
+
+jobs:
+  # Which release to test: the tag the Release workflow just published, the manual input, or
+  # none (build from the checkout).
+  plan:
+    if: >-
+      inputs.target != 'staging' &&
+      (github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    outputs:
+      release: ${{ steps.plan.outputs.release }}
+    steps:
+      - id: plan
+        env:
+          EVENT: ${{ github.event_name }}
+          RUN_TAG: ${{ github.event.workflow_run.head_branch }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          release=""
+          case $EVENT in
+            workflow_run) release=$RUN_TAG ;;
+            workflow_dispatch) release=$INPUT_VERSION ;;
+          esac
+          if [[ -n $release && ! $release =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::$release is not a release tag (v1.2.3 or v1.2.3-rc.1)"
+            exit 1
+          fi
+          echo "release=$release" >> "$GITHUB_OUTPUT"
+          echo "testing: ${release:-a build of $GITHUB_SHA}"
+
+  build:
+    needs: plan
+    if: needs.plan.outputs.release == ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # scripts/build.sh is the single place where the Go version is pinned.
+      - name: Read pinned Go version
+        id: pins
+        run: echo "go=$(sed -n 's/^GO_VERSION=//p' scripts/build.sh)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ steps.pins.outputs.go }}
+          cache: false # no go.sum in the repo; the module cache is handled below
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+            .tools
+          key: build-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('builder-config.yaml', 'scripts/build.sh') }}
+          restore-keys: build-${{ runner.os }}-${{ runner.arch }}-
+
+      # A version install.sh --version accepts (the git describe fallback has a "+").
+      - name: Build linux/amd64 and linux/arm64
+        env:
+          VERSION: v0.0.0-smoke.${{ github.run_number }}
+        run: scripts/build.sh
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: smoke-dist
+          path: dist/logember-agent_linux_*
+          if-no-files-found: error
+          retention-days: 3
+
+  smoke:
+    needs: [plan, build]
+    if: >-
+      !cancelled() && needs.plan.result == 'success' &&
+      (needs.build.result == 'success' || needs.build.result == 'skipped')
+    name: ${{ matrix.distro }} ${{ matrix.arch }}
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        distro: [ubuntu-24.04, debian-12]
+        arch: [amd64, arm64]
+    steps:
+      # After a release: test/smoke from the released commit.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          persist-credentials: false
+
+      - if: needs.plan.outputs.release == ''
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: smoke-dist
+          path: dist
+
+      # Prints the install, `systemctl is-active logember-agent`, the received marker records
+      # and the uninstall.
+      - name: test/smoke/run.sh
+        env:
+          DISTRO: ${{ matrix.distro }}
+          ARCH: ${{ matrix.arch }}
+          RELEASE: ${{ needs.plan.outputs.release }}
+        run: test/smoke/run.sh --distro "$DISTRO" --arch "$ARCH" ${RELEASE:+--release "$RELEASE"}
+
+  # Stub: against staging the marker can only be checked by reading it back from the hub, and
+  # CI has no enrollment token or hub credentials for staging yet.
+  staging:
+    if: github.event_name == 'workflow_dispatch' && inputs.target == 'staging'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - run: |
+          echo "::error::target=staging is not set up yet: it needs a CI enrollment token and hub credentials (repository secrets) and a hub query for the marker. Run with target=mock."
+          exit 1
