@@ -1,0 +1,4 @@
+Oct 26 12:00:05 web1 myapp[4242]: ERROR payment provider timed out after 30s
+2026-10-26T12:00:06.123456+00:00 web1 backup[99]: warning: disk /dev/sda1 is 91% full
+Oct 26 12:00:07 web1 myapp[4242]: order 1234 shipped
+

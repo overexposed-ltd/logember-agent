@@ -1,30 +1,52 @@
 # LogEmber agent: OpenTelemetry Collector pipeline.
 # Values in ${env:...} are written by install.sh into /etc/logember/agent.env.
+#
+# Every record leaving the agent follows proto/log-schema.json in the main LogEmber repo:
+#   body                          the raw line (journald: MESSAGE), never empty
+#   time                          from the line when it carries one, else the time the agent read it
+#   severity_text                 one of trace|debug|info|warn|error|fatal, severity_number to match
+#   attributes["logember.service"] unit, program, /var/log/<dir>/ or file name; "unknown" if none
+#   attributes["logember.env"]     $LOGEMBER_ENV
+#   other attributes              flattened JSON fields etc.: lowercase dotted keys, string values, max 64
+#   resource host.name            from resourcedetection
+#
+# Sources and double reading: journald is the primary source for system and service logs.
+# On Ubuntu (and Debian with rsyslog installed) rsyslog copies the same journal into
+# /var/log/syslog, auth.log, kern.log, ... so those files are NOT read; reading them too
+# would ship every system line twice. /var/log/*.log still catches files that applications
+# write themselves (dpkg.log, cloud-init.log, fail2ban.log, ...), which are not in journald.
 receivers:
   journald:
-    directory: /var/log/journal
+    # No `directory`: journalctl then reads both /var/log/journal (persistent) and /run/log/journal.
     priority: info
+    start_at: end
+    storage: file_storage
+    convert_message_bytes: true
+    operators:
+      - type: filter
+        expr: 'body.MESSAGE == nil or body.MESSAGE matches "^\\s*$"'
   filelog:
     include:
       - /var/log/*.log
       - /var/log/nginx/*.log
-      - /var/log/syslog
     exclude:
       - /var/log/logember-agent.log
+      # rsyslog copies of journald (see the note at the top)
+      - /var/log/auth.log
+      - /var/log/cron.log
+      - /var/log/daemon.log
+      - /var/log/kern.log
+      - /var/log/lpr.log
+      - /var/log/mail.log
+      - /var/log/ufw.log
+      - /var/log/user.log
     start_at: end
     storage: file_storage
     include_file_path: true
+    include_file_name: false
     operators:
-      - type: json_parser
-        if: 'body matches "^\\s*\\{"'
-        parse_from: body
-        timestamp:
-          parse_from: attributes.time
-          layout_type: gotime
-          layout: '2006-01-02T15:04:05.000Z07:00'
-        severity:
-          parse_from: attributes.level
-  docker_stats: {}  # placeholder; container logs come via filelog on /var/lib/docker/containers/*/*.log
+      - type: filter
+        expr: 'body matches "^\\s*$"'
 
 processors:
   memory_limiter:
@@ -33,15 +55,113 @@ processors:
   resourcedetection:
     detectors: [system]
     system: { hostname_sources: [os] }
-  transform/service:
+  # Maps both sources onto the record schema. One statement list, so `cache` (per record) carries
+  # the detected level and the parsed JSON from one step to the next. Statements that fail on a
+  # line (bad JSON, unparsable time) are skipped for that line only; `silent` keeps the agent from
+  # logging every such line into journald, where it would read its own warnings back.
+  transform/normalize:
+    error_mode: silent
     log_statements:
       - context: log
         statements:
-          # service from the file path: /var/log/nginx/access.log -> nginx
-          - set(attributes["logember.service"], "journald") where attributes["log.file.path"] == nil
-          - set(attributes["logember.service"], Split(attributes["log.file.path"], "/")[3]) where attributes["log.file.path"] != nil and IsMatch(attributes["log.file.path"], "^/var/log/[^/]+/")
-          - set(attributes["logember.service"], "system") where attributes["logember.service"] == nil
-          - set(attributes["logember.env"], "${env:LOGEMBER_ENV}")
+          # --- journald: the body is the journal entry as a map ---
+          - 'set(cache["journal"], body) where IsMap(body) and body["__CURSOR"] != nil'
+          # service: systemd unit without ".service" (and without a template instance: postgresql@16-main -> postgresql),
+          # else the syslog identifier, else the command name
+          - 'set(attributes["logember.service"], cache["journal"]["_COMM"]) where cache["journal"]["_COMM"] != nil'
+          - 'set(attributes["logember.service"], cache["journal"]["SYSLOG_IDENTIFIER"]) where cache["journal"]["SYSLOG_IDENTIFIER"] != nil'
+          - 'set(attributes["logember.service"], cache["journal"]["_SYSTEMD_UNIT"]) where IsMatch(cache["journal"]["_SYSTEMD_UNIT"], "\\.service$")'
+          - 'replace_pattern(attributes["logember.service"], "(@[^.]*)?\\.service$", "") where cache["journal"] != nil'
+          - 'set(cache["level"], cache["journal"]["PRIORITY"])'
+          - 'set(attributes["systemd.unit"], cache["journal"]["_SYSTEMD_UNIT"]) where cache["journal"]["_SYSTEMD_UNIT"] != nil'
+          - 'set(attributes["syslog.identifier"], cache["journal"]["SYSLOG_IDENTIFIER"]) where cache["journal"]["SYSLOG_IDENTIFIER"] != nil'
+          - 'set(attributes["process.pid"], cache["journal"]["_PID"]) where cache["journal"]["_PID"] != nil'
+          - 'set(attributes["process.command"], cache["journal"]["_COMM"]) where cache["journal"]["_COMM"] != nil'
+          - 'set(body, cache["journal"]["MESSAGE"]) where cache["journal"] != nil'
+
+          # --- files: service from the path, more specific rules below override it ---
+          # /var/log/dpkg.log -> dpkg
+          - 'set(attributes["logember.service"], ExtractPatterns(attributes["log.file.path"], "(?P<name>[^/]+?)(\\.log)?$")["name"])'
+          # syslog-format lines (rsyslog rules, apps logging via syslog to their own file):
+          # "Oct 26 12:00:00 web1 myapp[42]: msg" or "2026-10-26T12:00:00.123456+00:00 web1 myapp[42]: msg" -> myapp
+          - 'set(cache["syslog"], ExtractPatterns(body, "^(?P<ts>[A-Z][a-z]{2} [ 0-9]\\d \\d\\d:\\d\\d:\\d\\d|\\d{4}-\\d\\d-\\d\\dT\\d\\d:\\d\\d:\\d\\d\\S*) (?P<host>\\S+) (?P<prog>[^\\s\\[\\]:]+)(?:\\[(?P<pid>\\d+)\\])?: ")) where attributes["log.file.path"] != nil'
+          - 'set(attributes["logember.service"], cache["syslog"]["prog"]) where cache["syslog"]["prog"] != nil'
+          - 'set(attributes["syslog.identifier"], cache["syslog"]["prog"]) where cache["syslog"]["prog"] != nil'
+          - 'set(attributes["process.pid"], cache["syslog"]["pid"]) where cache["syslog"]["pid"] != nil'
+          - 'set(cache["ts"], cache["syslog"]["ts"]) where IsMatch(cache["syslog"]["ts"], "^\\d{4}-")'
+          # /var/log/nginx/error.log -> nginx
+          - 'set(attributes["logember.service"], ExtractPatterns(attributes["log.file.path"], "^/var/log/(?P<dir>[^/]+)/")["dir"]) where IsMatch(attributes["log.file.path"], "^/var/log/[^/]+/")'
+
+          # --- access logs (nginx/apache combined or common format): fields, time, severity from status ---
+          - 'set(cache["http"], ExtractPatterns(body, "^(?P<client>\\S+) \\S+ \\S+ \\[(?P<ts>[^\\]]+)\\] \"(?P<method>[A-Z]+) (?P<path>\\S+)[^\"]*\" (?P<status>\\d{3}) (?P<size>\\d+|-)(?: \"(?P<referer>[^\"]*)\" \"(?P<ua>[^\"]*)\")?")) where attributes["log.file.path"] != nil'
+          - 'set(attributes["client.address"], cache["http"]["client"]) where cache["http"]["client"] != nil'
+          - 'set(attributes["http.request.method"], cache["http"]["method"]) where cache["http"]["method"] != nil'
+          - 'set(attributes["url.path"], cache["http"]["path"]) where cache["http"]["path"] != nil'
+          - 'set(attributes["http.response.status_code"], cache["http"]["status"]) where cache["http"]["status"] != nil'
+          - 'set(attributes["http.response.body.size"], cache["http"]["size"]) where cache["http"]["size"] != nil and cache["http"]["size"] != "-"'
+          - 'set(attributes["http.request.header.referer"], cache["http"]["referer"]) where cache["http"]["referer"] != nil and cache["http"]["referer"] != "-"'
+          - 'set(attributes["user_agent.original"], cache["http"]["ua"]) where cache["http"]["ua"] != nil'
+          - 'set(time, Time(cache["http"]["ts"], "%d/%b/%Y:%H:%M:%S %z")) where cache["http"]["ts"] != nil'
+          - 'set(cache["level"], "error") where IsMatch(cache["http"]["status"], "^5")'
+          - 'set(cache["level"], "warn") where IsMatch(cache["http"]["status"], "^4")'
+          - 'set(cache["level"], "info") where IsMatch(cache["http"]["status"], "^[123]")'
+
+          # --- JSON lines: fields become attributes (flattened, lowercase dotted keys, string values) ---
+          - 'set(cache["json"], ParseJSON(body)) where IsString(body) and IsMatch(body, "^\\s*\\{")'
+          - 'flatten(cache["json"]) where IsMap(cache["json"])'
+          - 'replace_all_patterns(cache["json"], "key", "[A-Z]+", "$$0", ToLowerCase) where IsMap(cache["json"])'
+          - 'replace_all_patterns(cache["json"], "key", "\\s+", "_") where IsMap(cache["json"])'
+          - 'stringify_all(cache["json"]) where IsMap(cache["json"])'
+          # the logember.* keys are ours; a field of the same name must not override them
+          - 'delete_matching_keys(cache["json"], "^logember\\.") where IsMap(cache["json"])'
+          - 'merge_maps(attributes, cache["json"], "insert") where IsMap(cache["json"])'
+          - 'set(cache["level"], Coalesce([cache["json"]["level"], cache["json"]["severity"], cache["json"]["lvl"], cache["json"]["log.level"], cache["json"]["levelname"], cache["json"]["loglevel"]])) where IsMap(cache["json"])'
+          - 'set(cache["ts"], Coalesce([cache["json"]["time"], cache["json"]["timestamp"], cache["json"]["@timestamp"], cache["json"]["ts"], cache["json"]["datetime"]])) where IsMap(cache["json"])'
+          # RFC3339 / ISO 8601 (JSON fields, syslog lines): with or without fractional seconds,
+          # offset "Z", "+02:00" or "+0200", "T" or " " between date and time. No offset: not parsed.
+          - 'replace_pattern(cache["ts"], "^(\\d{4}-\\d\\d-\\d\\d) ", "$$1T")'
+          - 'replace_pattern(cache["ts"], "Z$", "+00:00")'
+          - 'replace_pattern(cache["ts"], "([+-]\\d\\d)(\\d\\d)$", "$$1:$$2")'
+          - 'set(time, Time(cache["ts"], "%Y-%m-%dT%H:%M:%S%j")) where IsMatch(cache["ts"], "^\\d{4}-\\d\\d-\\d\\dT")'
+          # Unix seconds (1793000000 or 1793000000.123) and milliseconds (1793000000123)
+          - 'set(time_unix_nano, Int(Double(cache["ts"]) * 1000000000.0)) where IsMatch(cache["ts"], "^\\d{10}(\\.\\d+)?$")'
+          - 'set(time_unix_nano, Int(cache["ts"]) * 1000000) where IsMatch(cache["ts"], "^\\d{13}$")'
+
+          # --- plain text (and JSON without a level field): guess the level from the line ---
+          # "not IsString": a set() from a missing value leaves an empty value behind, which is not nil.
+          # logfmt / key-value: level=warn, severity: ERROR
+          - 'set(cache["guess"], ExtractPatterns(body, "(?i)\\b(?:level|severity|lvl)[=:]\\s*\"?(?P<lvl>[a-z]+)")) where not IsString(cache["level"]) and IsString(body)'
+          - 'set(cache["level"], cache["guess"]["lvl"]) where cache["guess"]["lvl"] != nil'
+          # first level word: "ERROR ...", "[error]" (nginx error log), "<warn>", "sshd[1]: error: ...", an "ERROR ..." JSON string
+          - 'set(cache["guess"], ExtractPatterns(body, "(?:^|[\\s\\[<(|\"])(?P<lvl>TRACE|DEBUG|INFO|NOTICE|WARN|WARNING|ERROR|ERR|CRIT|CRITICAL|ALERT|EMERG|FATAL|PANIC|(?i:trace|debug|info|notice|warn|warning|error|err|crit|critical|alert|emerg|fatal|panic)[\\]>):|])(?:\\W|$)")) where not IsString(cache["level"]) and IsString(body)'
+          - 'set(cache["level"], cache["guess"]["lvl"]) where cache["guess"]["lvl"] != nil'
+
+          # --- severity: map whatever was found onto the schema enum ---
+          # Strings follow the OTel data model mappings: syslog crit/alert are ERROR, .NET/Python "critical" is FATAL.
+          # Numbers: 0-7 are syslog priorities (journald PRIORITY), 10-60 are pino/bunyan levels.
+          - 'set(cache["level"], ToLowerCase(String(cache["level"]))) where cache["level"] != nil'
+          - 'set(severity_text, "info")'
+          - 'set(severity_text, "trace") where IsMatch(cache["level"], "^(trace|trc|verbose|finest|10)\\b")'
+          - 'set(severity_text, "debug") where IsMatch(cache["level"], "^(debug|dbg|fine|finer|7|20)\\b")'
+          - 'set(severity_text, "warn") where IsMatch(cache["level"], "^(warn|warning|wrn|4|40)\\b")'
+          - 'set(severity_text, "error") where IsMatch(cache["level"], "^(error|err|eror|crit|alert|severe|1|2|3|50)\\b")'
+          - 'set(severity_text, "fatal") where IsMatch(cache["level"], "^(fatal|ftl|critical|emerg|emergency|panic|dpanic|0|60)\\b")'
+          - 'set(severity_number, SEVERITY_NUMBER_TRACE) where severity_text == "trace"'
+          - 'set(severity_number, SEVERITY_NUMBER_DEBUG) where severity_text == "debug"'
+          - 'set(severity_number, SEVERITY_NUMBER_INFO) where severity_text == "info"'
+          - 'set(severity_number, SEVERITY_NUMBER_WARN) where severity_text == "warn"'
+          - 'set(severity_number, SEVERITY_NUMBER_ERROR) where severity_text == "error"'
+          - 'set(severity_number, SEVERITY_NUMBER_FATAL) where severity_text == "fatal"'
+
+          # --- common ---
+          - 'set(time, observed_time) where time_unix_nano == 0'
+          - 'set(body, String(body)) where not IsString(body)'
+          - 'set(attributes["logember.service"], "unknown") where attributes["logember.service"] == nil or attributes["logember.service"] == ""'
+          - 'replace_pattern(attributes["logember.service"], "^(.{128}).+$", "$$1")'
+          - 'set(attributes["logember.env"], "${env:LOGEMBER_ENV}")'
+          - 'stringify_all(attributes)'
+          - 'truncate_all(attributes, 2048)'
+          - 'limit(attributes, 64, ["logember.service", "logember.env", "log.file.path"])'
   redaction:
     allow_all_keys: true
     blocked_values:
@@ -58,6 +178,7 @@ processors:
 extensions:
   file_storage:
     directory: /var/lib/logember/buffer
+    create_directory: true   # /var/lib/logember itself comes from StateDirectory= in the unit
     timeout: 10s
   bearertokenauth:
     token: "${env:LOGEMBER_INGEST_KEY}"
@@ -82,7 +203,7 @@ service:
   pipelines:
     logs:
       receivers: [journald, filelog]
-      processors: [memory_limiter, resourcedetection, transform/service, redaction, batch]
+      processors: [memory_limiter, resourcedetection, transform/normalize, redaction, batch]
       exporters: [otlphttp]
   telemetry:
     logs: { level: warn }

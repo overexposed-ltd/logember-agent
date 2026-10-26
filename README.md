@@ -9,8 +9,8 @@ curl -fsSL https://get.logember.com | sudo sh -s -- --token <ENROLLMENT_TOKEN>
 ## What it does
 
 1. On first start it exchanges the one-time enrollment token for a per-host ingest key (`POST /v1/enroll`), stored in `/etc/logember/credentials` (mode 600).
-2. It tails `journald`, `/var/log/*.log`, `/var/log/nginx/*.log` and Docker containers (when `/var/run/docker.sock` exists). Extra paths come from the hub (`GET /v1/agent/config`, polled every 5 minutes).
-3. Each line gets `host`, `service` (from the file path or container name), `env` and a parsed `severity`. JSON lines are unpacked into attributes.
+2. It tails `journald`, `/var/log/*.log`, `/var/log/nginx/*.log` and Docker containers (when `/var/run/docker.sock` exists). Files that rsyslog copies from journald (`/var/log/syslog`, `auth.log`, `kern.log`, ...) are skipped so nothing is sent twice. Extra paths come from the hub (`GET /v1/agent/config`, polled every 5 minutes).
+3. Each line gets `host`, `service` (systemd unit, program name, file path or container name; `unknown` if none), `env` and a `severity` (`trace`…`fatal`, from the journald priority, a JSON `level` field or the text of the line). JSON lines are unpacked into attributes (flattened, lowercase dotted keys, string values, at most 64).
 4. Secrets are redacted on the host, before anything leaves it: bearer tokens, `password=…`, AWS keys, card numbers, plus your own rules.
 5. Lines are batched (1 MB or 5 s) and sent over OTLP/HTTP with zstd to `https://ingest.logember.com/v1/logs`. If the network is down they are buffered on disk and retried with backoff.
 
@@ -30,7 +30,7 @@ Linux amd64 / arm64 with systemd (Debian, Ubuntu, RHEL/Alma/Rocky, Fedora). Dock
 
 ## Development
 
-Requires Go (any version ≥ 1.21) and curl. `scripts/build.sh` downloads the pinned [ocb](https://opentelemetry.io/docs/collector/custom-collector/) release (checksum-verified), builds with the pinned Go toolchain via `GOTOOLCHAIN`, and produces `dist/logember-agent_linux_{amd64,arm64}` plus `dist/checksums.txt`. Set `VERSION` to override the version taken from `git describe --tags`. Releases are published on GitHub Releases; `install.sh` always fetches the latest tagged version unless `--version` is given.
+Requires Go (any version ≥ 1.21) and curl. `scripts/build.sh` downloads the pinned [ocb](https://opentelemetry.io/docs/collector/custom-collector/) release (checksum-verified), builds with the pinned Go toolchain via `GOTOOLCHAIN`, and produces `dist/logember-agent_linux_{amd64,arm64}` plus `dist/checksums.txt`. Set `VERSION` to override the version taken from `git describe --tags`. `scripts/test-config.sh` then runs the built binary in a Debian 12 container against the sample logs in `test/fixtures` and checks every record it sends against the record schema (needs Docker and jq). Releases are published on GitHub Releases; `install.sh` always fetches the latest tagged version unless `--version` is given.
 
 The wire format and the record schema live in the main LogEmber repo under `proto/`.
 
