@@ -82,7 +82,7 @@ jobs:
 
       - name: shellcheck
         run: |
-          files=(install.sh scripts/*.sh)
+          files=(install.sh scripts/*.sh test/smoke/*.sh)
           [[ -f uninstall.sh ]] && files+=(uninstall.sh)
           shellcheck --version
           shellcheck "${files[@]}"

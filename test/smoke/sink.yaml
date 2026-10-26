@@ -1,0 +1,24 @@
+# OTLP sink for test/smoke/run.sh: a stock otelcol-contrib that stands in for ingest. It accepts
+# OTLP/HTTP on :4318 (protobuf and zstd, as the agent sends them) only with the ingest key the mock
+# hub handed out, and writes every request as one OTLP/JSON line to /out/logs.jsonl for jq.
+extensions:
+  bearertokenauth:
+    token: ${env:INGEST_KEY}
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+        auth: { authenticator: bearertokenauth }
+exporters:
+  file:
+    path: /out/logs.jsonl
+    flush_interval: 1s
+service:
+  extensions: [bearertokenauth]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [file]
+  telemetry:
+    logs: { level: warn }
