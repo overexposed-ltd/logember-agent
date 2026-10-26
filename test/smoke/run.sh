@@ -3,10 +3,12 @@
 #
 # Boots the distro with systemd as PID 1 in a privileged container (test/smoke/Dockerfile) and
 # runs the README one-liner in it as a sudo user, against a mock hub (test/smoke/mock-hub.py:
-# POST /v1/enroll, and the release assets) and an OTLP sink standing in for ingest
-# (test/smoke/sink.yaml). Then writes a unique marker line with a fake secret to /var/log and
-# through logger (journald), and checks that both arrive with logember.service, logember.env, a
-# valid severity, host.name and the secret redacted. Finally runs uninstall.sh --purge and checks
+# POST /v1/enroll, GET /v1/agent/config with one file source, POST /v1/agent/heartbeat, and the
+# release assets) and an OTLP sink standing in for ingest (test/smoke/sink.yaml). Checks the first
+# logember-agent-sync run (sources.yaml, heartbeat). Then writes a unique marker line with a fake
+# secret to /var/log, to the hub's file source and through logger (journald), and checks that all
+# three arrive with logember.service, logember.env, a valid severity, host.name and the secret
+# redacted. Finally runs uninstall.sh --purge and checks
 # that nothing is left.
 #
 #   test/smoke/run.sh --distro debian-12 [--arch arm64]          # assets from dist/ (scripts/build.sh)
@@ -25,6 +27,7 @@ SERVICE=logember-agent
 # The assets release.yml publishes; install.sh and uninstall.sh download from this set.
 ASSETS=(dist/logember-agent_linux_amd64 dist/logember-agent_linux_arm64
   config/agent.yaml config/redaction.yaml config/docker.yaml deploy/logember-agent.service
+  deploy/logember-agent-sync deploy/logember-agent-sync.service deploy/logember-agent-sync.timer
   install.sh uninstall.sh)
 
 DISTRO=""
@@ -178,6 +181,10 @@ else
   bad "unexpected output: $out"
 fi
 
+# The hub's file source exists before the install, as an application log would; its old line
+# must not be sent (new sources are read from their end).
+on_host bash -c "mkdir -p /srv/smoke && echo 'smoke-old-line-$ID written before the install' >/srv/smoke/app.log"
+
 install_cmd="curl -fsSL $ASSET_BASE/install.sh | sudo $RELEASE_ENV bash -s -- --token $TOKEN --version $VERSION --hub http://hub:8080 --ingest http://sink:4318 --env smoke"
 step "$install_cmd"
 as_user "$install_cmd" || die "install.sh failed"
@@ -202,12 +209,39 @@ else
   bad "/etc/logember/agent.env does not hold the ingest key from the hub"
 fi
 
+step "First sync with the hub (install.sh runs logember-agent-sync once)"
+result=$(on_host systemctl show -p Result --value logember-agent-sync.service 2>/dev/null) || result=""
+if [[ $result == success ]]; then ok "logember-agent-sync.service: $result"; else bad "logember-agent-sync.service: ${result:-unknown}"; fi
+timer=$(on_host systemctl is-active logember-agent-sync.timer 2>/dev/null) || timer=""
+if [[ $timer == active ]]; then ok "logember-agent-sync.timer is active"; else bad "logember-agent-sync.timer is ${timer:-unknown}"; fi
+if on_host grep -qxF "    include: ['/srv/smoke/app.log']" /etc/logember/sources.yaml; then
+  ok "/etc/logember/sources.yaml has the hub's source /srv/smoke/app.log"
+else
+  bad "/etc/logember/sources.yaml does not have /srv/smoke/app.log"
+fi
+heartbeat=$(tail -n 1 "$WORK/hub/heartbeat.jsonl" 2>/dev/null) || heartbeat=""
+if jq -e --arg v "$VERSION" '.agent_version == $v and .status == "active" and (.buffer_bytes | type == "number")' <<<"$heartbeat" >/dev/null; then
+  ok "POST /v1/agent/heartbeat $heartbeat"
+else
+  bad "POST /v1/agent/heartbeat body: ${heartbeat:-none}"
+fi
+
+# The sync restarted the agent with the hub's receiver; lines written before that receiver has
+# opened its file would be skipped (start_at: end), so wait for its file_storage entry.
+for _ in $(seq 1 30); do
+  on_host sh -c 'ls /var/lib/logember/buffer | grep -q filelog_hub_' && break
+  sleep 1
+done
+sleep 2
+
 # --- first lines -----------------------------------------------------------------------------
 
-step "Writing the marker $MARKER (with a fake secret) to /var/log and through logger"
+step "Writing the marker $MARKER (with a fake secret) to /var/log, the hub's source and through logger"
 file_line="WARN $MARKER from /var/log password=$SECRET"
+hub_line="ERROR $MARKER from the hub source password=$SECRET"
 journal_line="$MARKER from journald password=$SECRET"
 as_user "echo '$file_line' | sudo tee -a /var/log/logember-smoke.log >/dev/null"
+as_user "echo '$hub_line' | sudo tee -a /srv/smoke/app.log >/dev/null"
 as_user "logger -t logember-smoke -p user.err '$journal_line'"
 
 # One line per record, as in scripts/test-config.sh.
@@ -222,7 +256,7 @@ flatten() {
     }' "$WORK/sink/logs.jsonl" 2>/dev/null || true
 }
 for _ in $(seq 1 90); do
-  [[ $(flatten | grep -cF "$MARKER") -ge 2 ]] && break
+  [[ $(flatten | grep -cF "$MARKER") -ge 3 ]] && break
   sleep 1
 done
 flatten >"$WORK/records.jsonl"
@@ -246,6 +280,11 @@ check() {
      | length == 1 and (.[0] | .body == "WARN \($m) from /var/log password=****"
        and .attrs["logember.service"] == "logember-smoke" and .attrs["logember.env"] == "smoke"
        and .severity_text == "warn" and (.severity_number == 13 or .severity_number == "13") and .host == $host)'
+  check "the hub source line arrived once: service from the hub, env, error, host.name, secret redacted" \
+    'map(select(.body | contains($m)) | select(.attrs["log.file.path"] == "/srv/smoke/app.log"))
+     | length == 1 and (.[0] | .body == "ERROR \($m) from the hub source password=****"
+       and .attrs["logember.service"] == "smoke-app" and .attrs["logember.env"] == "smoke"
+       and .severity_text == "error" and .host == $host and .attrs["logember.source.service"] == null)'
   check "the logger line arrived once via journald: service, env, error, host.name, secret redacted" \
     'map(select(.body | contains($m)) | select(.attrs["log.file.path"] == null))
      | length == 1 and (.[0] | .body == "\($m) from journald password=****"
@@ -259,6 +298,11 @@ check() {
        and ({"trace":1,"debug":5,"info":9,"warn":13,"error":17,"fatal":21}[.severity_text] as $n
             | $n != null and (.severity_number == $n or .severity_number == ($n | tostring))))'
 }
+if grep -qF -- "smoke-old-line-$ID" "$WORK/sink/logs.jsonl" 2>/dev/null; then
+  bad "the line written to the hub's source before the install was sent"
+else
+  ok "the line written to the hub's source before the install was not sent"
+fi
 if grep -qF -- "$SECRET" "$WORK/sink/logs.jsonl" 2>/dev/null; then
   bad "the fake secret $SECRET reached the sink"
 else
@@ -273,7 +317,8 @@ as_user "$uninstall_cmd" || die "uninstall.sh failed"
 state=$(on_host systemctl is-active "$SERVICE" 2>/dev/null) || true
 echo "systemctl is-active $SERVICE: $state"
 [[ $state != active ]] || bad "$SERVICE is still active"
-for path in /usr/local/bin/logember-agent /etc/systemd/system/$SERVICE.service /etc/logember /var/lib/logember; do
+for path in /usr/local/bin/logember-agent /usr/local/bin/logember-agent-sync /etc/systemd/system/$SERVICE.service \
+  /etc/systemd/system/$SERVICE-sync.service /etc/systemd/system/$SERVICE-sync.timer /etc/logember /var/lib/logember; do
   if on_host test -e "$path"; then bad "$path is still there"; else ok "$path removed"; fi
 done
 if on_host id logember >/dev/null 2>&1; then bad "user logember is still there"; else ok "user logember removed"; fi

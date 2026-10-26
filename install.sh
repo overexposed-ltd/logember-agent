@@ -4,14 +4,16 @@
 #   curl -fsSL https://get.logember.com | sudo bash -s -- --token <ENROLLMENT_TOKEN>
 #
 # Downloads the release assets, verifies every one against the release's checksums.txt
-# before anything is written, enrolls the host with the hub (once) and starts the
-# systemd unit. Safe to re-run: upgrades the binary, agent.yaml and the unit, and keeps
-# the existing ingest key unless --reenroll is given. redaction.yaml (the host's own
+# before anything is written, enrolls the host with the hub (once), starts the systemd unit
+# and the timer that syncs the host's sources with the hub and sends heartbeats. Safe to
+# re-run: upgrades the binary, agent.yaml and the units, and keeps the existing ingest key
+# unless --reenroll is given. redaction.yaml (the host's own
 # redaction rules) is written once and never overwritten. See --help for all options.
 #
 # Release assets used: checksums.txt, logember-agent_linux_{amd64,arm64}, agent.yaml,
-# redaction.yaml, docker.yaml, logember-agent.service. Everything runs from main() on the
-# last line, so a download cut short by the network runs nothing.
+# redaction.yaml, docker.yaml, logember-agent.service, logember-agent-sync{,.service,.timer}.
+# Everything runs from main() on the last line, so a download cut short by the network runs
+# nothing.
 
 # This check must stay POSIX: `sh` on Debian/Ubuntu is dash, which stops here.
 if [ -z "${BASH_VERSION:-}" ]; then
@@ -30,8 +32,11 @@ AGENT_USER="logember"
 BIN="/usr/local/bin/logember-agent"
 CONF_DIR="/etc/logember"
 ENV_FILE="$CONF_DIR/agent.env"
-UNIT_FILE="/etc/systemd/system/$SERVICE.service"
+UNIT_DIR="/etc/systemd/system"
+UNIT_FILE="$UNIT_DIR/$SERVICE.service"
 STATE_DIR="/var/lib/logember"
+# Every 5 minutes: sources from the hub into $CONF_DIR/sources.yaml, then a heartbeat.
+SYNC="$SERVICE-sync"
 # Groups whose logs the agent reads; the user joins the ones that exist on this host.
 # docker gives access to the Docker API, which names containers (see docker.yaml); the log
 # files themselves are read with CAP_DAC_READ_SEARCH from the unit.
@@ -71,7 +76,8 @@ Re-running the script upgrades the binary, /etc/logember/agent.yaml and the syst
 then restarts the agent. The ingest key in /etc/logember/agent.env is kept unless
 --reenroll is given; --hub, --ingest and --env default to the values already there.
 /etc/logember/redaction.yaml holds this host's own redaction rules: it is written on the
-first install only, so edits to it are kept.
+first install only, so edits to it are kept. Files added in the hub are fetched every
+5 minutes by logember-agent-sync.timer into /etc/logember/sources.yaml.
 
 Environment (tests only):
   LOGEMBER_RELEASE_BASE  replaces https://github.com/overexposed-ltd/logember-agent/releases;
@@ -230,7 +236,8 @@ download_release() {
     ASSET_URL=$base/download/$VERSION
   fi
 
-  local asset assets=("logember-agent_linux_$ARCH" agent.yaml redaction.yaml docker.yaml logember-agent.service)
+  local asset assets=("logember-agent_linux_$ARCH" agent.yaml redaction.yaml docker.yaml logember-agent.service
+    "$SYNC" "$SYNC.service" "$SYNC.timer")
   info "Downloading logember-agent $VERSION (linux/$ARCH) from $ASSET_URL"
   download checksums.txt
   for asset in "${assets[@]}"; do
@@ -269,7 +276,18 @@ install_files() {
   if [[ ! -f $CONF_DIR/redaction.yaml ]]; then
     put "$TMP/redaction.yaml" "$CONF_DIR/redaction.yaml" 0640 "$AGENT_USER"
   fi
+  # Files added in the hub, one of the unit's --config files. logember-agent-sync replaces it
+  # with the sources from the hub; until then it adds nothing.
+  if [[ ! -f $CONF_DIR/sources.yaml ]]; then
+    echo "# Written by logember-agent-sync from GET /v1/agent/config: no sources from the hub yet." >"$TMP/sources.yaml"
+    put "$TMP/sources.yaml" "$CONF_DIR/sources.yaml" 0640 "$AGENT_USER"
+  fi
+  # Forget the ETag, so the first sync after an upgrade writes sources.yaml in this version's format.
+  rm -f "$STATE_DIR/sources.etag"
   put "$TMP/logember-agent.service" "$UNIT_FILE" 0644 root
+  put "$TMP/$SYNC" "$BIN-sync" 0755 root
+  put "$TMP/$SYNC.service" "$UNIT_DIR/$SYNC.service" 0644 root
+  put "$TMP/$SYNC.timer" "$UNIT_DIR/$SYNC.timer" 0644 root
 
   # The binary prints "logember-agent version 0.1.0".
   local out
@@ -376,6 +394,17 @@ start_agent() {
   fi
 }
 
+# First sync right away: the hub sees the host (heartbeat) and its sources are read now, not
+# in 5 minutes. A failure here is not fatal: the timer retries every 5 minutes.
+start_sync() {
+  info "Starting $SYNC.timer (sources from the hub and heartbeat every 5 minutes)"
+  systemctl enable --now --quiet "$SYNC.timer"
+  if ! systemctl start "$SYNC.service"; then
+    journalctl -u "$SYNC" -n 10 --no-pager >&2 || true
+    warn "the first sync with $HUB failed (see above); $SYNC.timer retries every 5 minutes. See: journalctl -u $SYNC"
+  fi
+}
+
 main() {
   parse_args "$@"
   check_host
@@ -397,6 +426,7 @@ main() {
   fi
   write_env
   start_agent
+  start_sync
   info "logember-agent $AGENT_VERSION is running. The host should appear in the hub ($HUB) within a minute."
 }
 

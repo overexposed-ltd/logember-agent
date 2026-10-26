@@ -1,6 +1,6 @@
 # logember-agent
 
-The agent that ships your servers' logs to [LogEmber](https://logember.com). It is a thin wrapper around the [OpenTelemetry Collector](https://opentelemetry.io/docs/collector/): one binary, one config file, one systemd unit. Everything it sends and everything it redacts before sending is visible in `config/agent.yaml`; your own redaction rules go in `config/redaction.yaml`.
+The agent that ships your servers' logs to [LogEmber](https://logember.com). It is a thin wrapper around the [OpenTelemetry Collector](https://opentelemetry.io/docs/collector/): one binary, one config file, one systemd unit (plus a timer that syncs with the hub). Everything it sends and everything it redacts before sending is visible in `config/agent.yaml`; your own redaction rules go in `config/redaction.yaml`.
 
 ```bash
 curl -fsSL https://get.logember.com | sudo bash -s -- --token <ENROLLMENT_TOKEN>
@@ -10,13 +10,13 @@ Create the enrollment token in the hub under Settings → Keys → Enrollment to
 
 ## What it does
 
-1. `install.sh` downloads the release from GitHub Releases and checks every file against the release's `checksums.txt` before writing anything. On the first install it exchanges the one-time enrollment token for a per-host ingest key (`POST /v1/enroll` on the hub) and stores it in `/etc/logember/agent.env` (see [Files on the host](#files-on-the-host)). It also creates the `logember` system user, enables the `logember-agent` systemd unit and waits until the agent stays running.
-2. The agent reads `journald` (priority `info` and above), `/var/log/*.log`, `/var/log/nginx/*.log` and Docker containers (see [Docker](#docker)), starting at the end of each source, so older lines are not sent. Files that rsyslog copies from journald (`/var/log/syslog`, `auth.log`, `kern.log`, ...) are skipped so nothing is sent twice.
+1. `install.sh` downloads the release from GitHub Releases and checks every file against the release's `checksums.txt` before writing anything. On the first install it exchanges the one-time enrollment token for a per-host ingest key (`POST /v1/enroll` on the hub) and stores it in `/etc/logember/agent.env` (see [Files on the host](#files-on-the-host)). It also creates the `logember` system user, enables the `logember-agent` systemd unit, waits until the agent stays running, and starts `logember-agent-sync.timer` (see [Sources from the hub and heartbeat](#sources-from-the-hub-and-heartbeat)).
+2. The agent reads `journald` (priority `info` and above), `/var/log/*.log`, `/var/log/nginx/*.log` and Docker containers (see [Docker](#docker)), starting at the end of each source, so older lines are not sent. Files that rsyslog copies from journald (`/var/log/syslog`, `auth.log`, `kern.log`, ...) are skipped so nothing is sent twice. Files you add in the hub are read too, within 5 minutes and without a restart by hand.
 3. Each record gets the attributes `logember.service` (systemd unit, program name, file name, container name or short container ID; `unknown` if none) and `logember.env` (`--env`), the resource attribute `host.name`, and a severity (`trace`…`fatal`, from the journald priority, a JSON `level` field or the text of the line). JSON lines are unpacked into attributes (flattened, lowercase dotted keys, string values, at most 64). The schema is `proto/log-schema.json` in the main LogEmber repo.
 4. Secrets are redacted on the host, before anything leaves it, in the log line and in every attribute: `Authorization` headers and bearer tokens, `password=…`, `api_key: …`, `"token":"…"` and similar (the key stays, the value becomes `****`), attributes named like a secret, AWS access key IDs, card numbers, email addresses, plus your own rules (see [Redaction](#redaction)).
 5. Records are batched (8192 records or 5 s, at most 16384 per request) and sent over OTLP/HTTP (protobuf, zstd) to `https://ingest.logember.com/v1/logs`. If ingest cannot be reached they wait in a queue on disk and are retried with backoff (see [Disk buffer](#disk-buffer)).
 
-The hub is only contacted by `install.sh`, for enrollment; the running agent talks to ingest only. Nothing listens on a network port except the collector's own metrics endpoint on `localhost:8888`.
+The hub is contacted by `install.sh`, for enrollment, and every 5 minutes by `logember-agent-sync`, for the sources and a heartbeat; the collector itself talks to ingest only. Nothing listens on a network port except the collector's own metrics endpoint on `localhost:8888`.
 
 ## Install options
 
@@ -29,7 +29,7 @@ The hub is only contacted by `install.sh`, for enrollment; the running agent tal
 | `--env NAME` | `production` | Value of `logember.env` on every record. Letters, digits, `.`, `_`, `-`. |
 | `--reenroll` | | Enroll again even though the host already has an ingest key. |
 
-Re-running the script upgrades the agent: the binary, `/etc/logember/agent.yaml`, `docker.yaml` and the unit are replaced, then the agent restarts. The ingest key is kept, so no token is needed:
+Re-running the script upgrades the agent: the binary, `logember-agent-sync`, `/etc/logember/agent.yaml`, `docker.yaml` and the units are replaced, then the agent restarts. The ingest key is kept, so no token is needed:
 
 ```bash
 curl -fsSL https://get.logember.com | sudo bash
@@ -49,11 +49,15 @@ journalctl -u logember-agent -n 50 --no-pager
 | Path | What | Upgrade | Uninstall |
 |---|---|---|---|
 | `/usr/local/bin/logember-agent` | the collector binary | replaced | removed |
+| `/usr/local/bin/logember-agent-sync` | sources from the hub and heartbeat (POSIX sh) | replaced | removed |
 | `/etc/systemd/system/logember-agent.service` | systemd unit | replaced | removed |
+| `/etc/systemd/system/logember-agent-sync.{service,timer}` | runs `logember-agent-sync` every 5 minutes | replaced | removed |
 | `/etc/logember/agent.yaml` | pipeline (`config/agent.yaml`) | replaced | kept, `--purge` removes |
 | `/etc/logember/docker.yaml` | Docker container names (`config/docker.yaml`) | replaced | kept, `--purge` removes |
 | `/etc/logember/redaction.yaml` | your redaction rules | **kept** | kept, `--purge` removes |
 | `/etc/logember/agent.env` | `LOGEMBER_INGEST_KEY`, `LOGEMBER_INGEST_URL`, `LOGEMBER_HUB_URL`, `LOGEMBER_ENV` | rewritten with the same values | kept, `--purge` removes |
+| `/etc/logember/sources.yaml` | files added in the hub, written by `logember-agent-sync` | kept, rewritten on the next change in the hub | kept, `--purge` removes |
+| `/var/lib/logember/sources.etag` | ETag of the last `GET /v1/agent/config` | removed (the next sync fetches again) | kept, `--purge` removes |
 | `/var/lib/logember/buffer/` | disk queue and read positions | kept | kept, `--purge` removes |
 
 `/etc/logember` is owned by `logember` with mode 0750; `agent.env` is mode 0600 and is read by systemd as the unit's `EnvironmentFile`. The ingest key identifies the host to LogEmber: treat `agent.env` as a secret.
@@ -77,6 +81,18 @@ Container logs are read from the files of Docker's default `json-file` log drive
 
 There is no container image of the agent in v0.1.0. On a host where everything else runs in containers, install the agent on the host itself with the same one-liner: it runs under systemd next to `dockerd` and collects every container's logs from `/var/lib/docker/containers`, plus the host's journal. The host needs systemd and bash (see [Supported platforms](#supported-platforms)); hosts that cannot run systemd services, such as Docker Desktop or a container-only OS without systemd, are not supported in v0.1.0.
 
+## Sources from the hub and heartbeat
+
+Every 5 minutes `logember-agent-sync.timer` runs `/usr/local/bin/logember-agent-sync`, a short POSIX shell script, as root. `install.sh` also runs it once right after the agent starts.
+
+1. `GET /v1/agent/config` on the hub with the host's ingest key and the ETag of the last answer (`If-None-Match`). When the files added in the hub have changed, it writes them to `/etc/logember/sources.yaml`, one `filelog` receiver per path in a pipeline of their own (`logs/hub`, with the same processors and redaction as everything else), checks the result with `logember-agent validate` and restarts `logember-agent`. `logember.service` on those lines is the service name set in the hub. A new file is read from its end, like the default sources, so lines written to it before the agent has restarted with it are not sent; files that appear later are read from the start.
+2. `POST /v1/agent/heartbeat` with the agent version, the state of the agent (`systemctl is-active logember-agent`) and the size of the disk buffer in bytes. The hub updates the host's last-seen time and agent version.
+
+- **Paths** must be absolute; globs work (`/var/www/*/storage/logs/*.log`). Sources that are not files, relative paths and paths the default sources already read (`/var/log/*.log`, `/var/log/nginx/*.log`) are skipped, with a warning in the journal. The agent can read any file regardless of permissions (`CAP_DAC_READ_SEARCH`, see [Docker](#docker)), but nothing under `/home` and `/root` (`ProtectHome=true`).
+- **When something fails**, nothing changes on the host: if the hub cannot be reached or answers with an error, the agent keeps its current sources, and if the new sources do not pass `validate`, `sources.yaml` is kept as it is. The next run is 5 minutes later. The heartbeat is sent either way.
+- **Do not edit `sources.yaml`**: it is replaced on the next change in the hub.
+- **Logs**: `journalctl -u logember-agent-sync` (a line only when the sources change or something fails). `sudo systemctl start logember-agent-sync` syncs now; `systemctl list-timers logember-agent-sync.timer` shows the next run.
+
 ## Self-hosted hub
 
 By default the agent enrolls with `https://app.logember.com` and sends to `https://ingest.logember.com`. To use your own hub and ingest, pass both URLs on the first install:
@@ -91,10 +107,11 @@ The URLs are stored in `/etc/logember/agent.env` and kept on upgrade. To move an
 What has to be reachable from the host, all outbound HTTPS (nothing connects to the host):
 
 - **github.com**, at install and upgrade time, for the release download (GitHub redirects it to a `githubusercontent.com` host).
-- **The hub**, at install time only: `POST <hub>/v1/enroll` with `Content-Type: application/json` and the body `{"token", "hostname", "os", "arch", "agent_version"}`. A 2xx answer must be JSON with an `ingest_key` string (letters, digits and `._~+/=-`). Errors: 401 means an unknown token and 410 a token that is used up or expired; for 410 and any other error status, the `message` field of a JSON answer is shown to whoever runs the script. The request is sent once, without retries, so a token is never used twice.
+- **The hub**, at install time: `POST <hub>/v1/enroll` with `Content-Type: application/json` and the body `{"token", "hostname", "os", "arch", "agent_version"}`. A 2xx answer must be JSON with an `ingest_key` string (letters, digits and `._~+/=-`). Errors: 401 means an unknown token and 410 a token that is used up or expired; for 410 and any other error status, the `message` field of a JSON answer is shown to whoever runs the script. The request is sent once, without retries, so a token is never used twice.
+- **The hub**, every 5 minutes (`logember-agent-sync`): `GET <hub>/v1/agent/config` with `Authorization: Bearer <ingest_key>` and `If-None-Match`, answered with `304` or `200` and `{"sources": [{"type": "file", "path", "service_name"}]}` plus an `ETag`; then `POST <hub>/v1/agent/heartbeat` with `{"agent_version", "status", "buffer_bytes"}`, answered with any 2xx.
 - **Ingest**, all the time: OTLP/HTTP `POST <ingest>/v1/logs` (the exporter appends `/v1/logs` to `--ingest`), protobuf, `Content-Encoding: zstd`, `Authorization: Bearer <ingest_key>`. Retries and drops are described under [Disk buffer](#disk-buffer).
 
-TLS: both URLs should be `https://`. Certificates are checked against the host's system CA bundle by both `curl` (enrollment) and the agent (ingest), and there is no option to skip the check. For a private CA, add it to the system store before installing:
+TLS: both URLs should be `https://`. Certificates are checked against the host's system CA bundle by `curl` (enrollment, `logember-agent-sync`) and by the agent (ingest), and there is no option to skip the check. For a private CA, add it to the system store before installing:
 
 ```bash
 sudo cp my-ca.crt /usr/local/share/ca-certificates/my-ca.crt
@@ -136,7 +153,7 @@ Use single quotes around each rule and write a literal `$` as `$$`. Card numbers
 curl -fsSL https://github.com/overexposed-ltd/logember-agent/releases/latest/download/uninstall.sh | sudo bash
 ```
 
-This stops and disables the unit and removes `/usr/local/bin/logember-agent` and the unit file. `/etc/logember` (config, your redaction rules, the ingest key) and `/var/lib/logember` (the disk buffer) are kept, so installing again picks up where it left off. To remove them and the `logember` user as well:
+This stops and disables the units and removes `/usr/local/bin/logember-agent`, `/usr/local/bin/logember-agent-sync` and the unit files. `/etc/logember` (config, your redaction rules, the ingest key) and `/var/lib/logember` (the disk buffer) are kept, so installing again picks up where it left off. To remove them and the `logember` user as well:
 
 ```bash
 curl -fsSL https://github.com/overexposed-ltd/logember-agent/releases/latest/download/uninstall.sh | sudo bash -s -- --purge
@@ -159,13 +176,15 @@ config/agent.yaml     OpenTelemetry Collector pipeline (receivers → processors
 config/docker.yaml    overlay that names Docker containers through the Docker API (loaded when it is reachable)
 config/redaction.yaml the host's own redaction rules (/etc/logember/redaction.yaml, kept on upgrade)
 deploy/logember-agent.service   systemd unit
+deploy/logember-agent-sync      sources from the hub and heartbeat (POSIX sh), with its .service and .timer (every 5 minutes)
 scripts/build.sh      builds the collector binary with ocb (only the components in config/)
 scripts/test-config.sh runs the built binary against test/fixtures and checks the records it sends
+scripts/test-sync.sh  runs logember-agent-sync against test/hub-mock.py, then the agent on the sources.yaml it wrote
 ```
 
 ## Development
 
-Requires Go (any version ≥ 1.21) and curl. `scripts/build.sh` downloads the pinned [ocb](https://opentelemetry.io/docs/collector/custom-collector/) release (checksum-verified), builds with the pinned Go toolchain via `GOTOOLCHAIN`, and produces `dist/logember-agent_linux_{amd64,arm64}` plus `dist/checksums.txt`. Set `VERSION` to override the version taken from `git describe --tags`. `scripts/test-config.sh` then runs the built binary in a Debian 12 container against the sample logs in `test/fixtures` and checks every record it sends against the record schema (needs Docker and jq). `test/smoke/run.sh --distro ubuntu-24.04|debian-12 [--arch amd64|arm64]` is the end-to-end check: it boots the distro with systemd in a privileged container, runs the one-liner as a sudo user against a mock hub and an OTLP sink, checks that a marker line written to `/var/log` and through `logger` arrives with `logember.service`, `logember.env`, a valid severity and its fake secret redacted, then uninstalls (needs Docker and jq; `--release vX.Y.Z` tests a published release instead of `dist/`). CI runs it on all four distro/arch combinations (`.github/workflows/smoke.yml`). Pushing a tag `v*` publishes a GitHub Release (`.github/workflows/release.yml`); tags with a suffix such as `v0.1.0-rc.1` become pre-releases, which `install.sh` installs only with `--version`.
+Requires Go (any version ≥ 1.21) and curl. `scripts/build.sh` downloads the pinned [ocb](https://opentelemetry.io/docs/collector/custom-collector/) release (checksum-verified), builds with the pinned Go toolchain via `GOTOOLCHAIN`, and produces `dist/logember-agent_linux_{amd64,arm64}` plus `dist/checksums.txt`. Set `VERSION` to override the version taken from `git describe --tags`. `scripts/test-config.sh` then runs the built binary in a Debian 12 container against the sample logs in `test/fixtures` and checks every record it sends against the record schema (needs Docker and jq). `scripts/test-sync.sh` runs `logember-agent-sync` against a mock of the hub's agent API (`test/hub-mock.py`), with mawk, gawk and busybox awk, and then the agent on the `sources.yaml` it wrote (needs Docker). `test/smoke/run.sh --distro ubuntu-24.04|debian-12 [--arch amd64|arm64]` is the end-to-end check: it boots the distro with systemd in a privileged container, runs the one-liner as a sudo user against a mock hub and an OTLP sink, checks the first sync with the hub and that a marker line written to `/var/log`, to a file source from the hub and through `logger` arrives with `logember.service`, `logember.env`, a valid severity and its fake secret redacted, then uninstalls (needs Docker and jq; `--release vX.Y.Z` tests a published release instead of `dist/`). CI runs it on all four distro/arch combinations (`.github/workflows/smoke.yml`). Pushing a tag `v*` publishes a GitHub Release (`.github/workflows/release.yml`); tags with a suffix such as `v0.1.0-rc.1` become pre-releases, which `install.sh` installs only with `--version`.
 
 The wire format and the record schema live in the main LogEmber repo under `proto/`.
 

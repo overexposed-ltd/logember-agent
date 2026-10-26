@@ -82,8 +82,7 @@ jobs:
 
       - name: shellcheck
         run: |
-          files=(install.sh scripts/*.sh test/smoke/*.sh)
-          [[ -f uninstall.sh ]] && files+=(uninstall.sh)
+          files=(install.sh uninstall.sh deploy/logember-agent-sync scripts/*.sh test/smoke/*.sh)
           shellcheck --version
           shellcheck "${files[@]}"
 
@@ -123,3 +122,7 @@ jobs:
       - name: scripts/test-config.sh
         if: hashFiles('scripts/test-config.sh') != ''
         run: ARCH="$(dpkg --print-architecture)" scripts/test-config.sh
+
+      # Runs logember-agent-sync against a mock hub, then the agent on the sources.yaml it wrote.
+      - name: scripts/test-sync.sh
+        run: ARCH="$(dpkg --print-architecture)" scripts/test-sync.sh

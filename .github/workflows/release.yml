@@ -92,12 +92,13 @@ jobs:
           mkdir -p "$RUNNER_TEMP/release"
           for f in dist/logember-agent_linux_amd64 dist/logember-agent_linux_arm64 \
             config/agent.yaml config/redaction.yaml config/docker.yaml deploy/logember-agent.service \
+            deploy/logember-agent-sync deploy/logember-agent-sync.service deploy/logember-agent-sync.timer \
             install.sh uninstall.sh; do
             [[ -f $f ]] || { echo "::error::$f is missing; every release needs it"; exit 1; }
             cp "$f" "$RUNNER_TEMP/release/"
           done
           cd "$RUNNER_TEMP/release"
-          chmod 0755 logember-agent_linux_* install.sh uninstall.sh
+          chmod 0755 logember-agent_linux_* logember-agent-sync install.sh uninstall.sh
           sha256sum -- * > checksums.txt
           sha256sum -c checksums.txt
           cat checksums.txt
