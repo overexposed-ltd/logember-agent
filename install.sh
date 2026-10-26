@@ -56,7 +56,8 @@ Usage:
 Options:
   --token TOKEN     enrollment token from the hub (Settings → Keys → Enrollment token).
                     Required on the first install and with --reenroll.
-  --version vX.Y.Z  release to install (default: latest)
+  --version vX.Y.Z  release to install, e.g. v0.1.0 or v0.1.0-rc.1 (default: latest,
+                    the newest release that is not a pre-release)
   --hub URL         hub URL (default: https://app.logember.com)
   --ingest URL      ingest URL (default: https://ingest.logember.com)
   --env NAME        value of the env attribute on every log line (default: production)
@@ -117,8 +118,8 @@ parse_args() {
       *) die_usage "unknown option: $1" ;;
     esac
   done
-  if [[ $VERSION != latest && ! $VERSION =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-    die_usage "--version must look like v1.2.3 (or be 'latest'), got: $VERSION"
+  if [[ $VERSION != latest && ! $VERSION =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+    die_usage "--version must look like v1.2.3 or v1.2.3-rc.1 (or be 'latest'), got: $VERSION"
   fi
   if [[ -n $TOKEN && ! $TOKEN =~ ^[A-Za-z0-9][A-Za-z0-9._~+/=-]{7,255}$ ]]; then
     die_usage "--token does not look like an enrollment token; copy it again from the hub"
