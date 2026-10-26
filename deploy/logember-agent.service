@@ -23,6 +23,15 @@ Restart=always
 RestartSec=5
 LimitNOFILE=65536
 MemoryMax=512M
+# The agent shares the host with the applications it watches and must never compete with them:
+# at most half a CPU core (journalctl, which the journald receiver starts, included), lowest
+# CPU priority, and lowest disk priority where the I/O scheduler honours it (BFQ). When it is
+# held back, reading slows down and lines wait in the files and the journal (see "Disk buffer"
+# in the README).
+CPUQuota=50%
+Nice=19
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
 # Docker container logs (/var/lib/docker/containers: root 0710, files root 0640) are not readable
 # through any group. CAP_DAC_READ_SEARCH lets the agent read and list files whatever their
 # permissions; it grants no write access and no other capability. The paths below hold
