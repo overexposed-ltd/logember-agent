@@ -1,0 +1,12 @@
+[Unit]
+Description=LogEmber agent: sync with the hub every 5 minutes
+
+[Timer]
+OnBootSec=1min
+# Counted from this host's last run, so hosts do not all hit the hub at once. A source added
+# in the hub is read within 5 minutes (AccuracySec: by default systemd may add up to a minute).
+OnUnitActiveSec=5min
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target

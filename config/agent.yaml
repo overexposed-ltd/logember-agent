@@ -10,6 +10,10 @@
 #   other attributes              flattened JSON fields etc.: lowercase dotted keys, string values, max 64
 #   resource host.name            from resourcedetection
 #
+# Extra files added in the hub come from /etc/logember/sources.yaml, which logember-agent-sync
+# writes (one filelog/hub_* receiver each, in the pipeline logs/hub) and the unit passes as
+# another --config.
+#
 # Sources and double reading: journald is the primary source for system and service logs.
 # On Ubuntu (and Debian with rsyslog installed) rsyslog copies the same journal into
 # /var/log/syslog, auth.log, kern.log, ... so those files are NOT read; reading them too
@@ -138,6 +142,9 @@ processors:
           - 'set(attributes["container.image.name"], resource.attributes["container.image.name"]) where IsString(cache["docker"]["id"]) and IsString(resource.attributes["container.image.name"])'
           - 'set(attributes["container.name"], resource.attributes["container.name"]) where IsString(cache["docker"]["id"]) and IsString(resource.attributes["container.name"])'
           - 'set(attributes["logember.service"], attributes["container.name"]) where IsString(attributes["container.name"]) and attributes["container.name"] != ""'
+          # files added in the hub (/etc/logember/sources.yaml): the service set there wins
+          - 'set(attributes["logember.service"], attributes["logember.source.service"]) where attributes["logember.source.service"] != nil'
+          - 'delete_key(attributes, "logember.source.service")'
 
           # --- access logs (nginx/apache combined or common format): fields, time, severity from status ---
           - 'set(cache["http"], ExtractPatterns(body, "^(?P<client>\\S+) \\S+ \\S+ \\[(?P<ts>[^\\]]+)\\] \"(?P<method>[A-Z]+) (?P<path>\\S+)[^\"]*\" (?P<status>\\d{3}) (?P<size>\\d+|-)(?: \"(?P<referer>[^\"]*)\" \"(?P<ua>[^\"]*)\")?")) where attributes["log.file.path"] != nil'
@@ -297,6 +304,8 @@ service:
   pipelines:
     logs:
       receivers: [journald, filelog, filelog/docker]   # config/docker.yaml restates this list
+      # sources.yaml adds a pipeline logs/hub with the hub's receivers and these processors and
+      # exporters: change PROCESSORS and EXPORTERS in deploy/logember-agent-sync with them.
       processors: [memory_limiter, resourcedetection, transform/normalize, transform/redact, redaction, redaction/local, batch]
       exporters: [otlphttp]
   telemetry:

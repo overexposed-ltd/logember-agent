@@ -1,0 +1,18 @@
+[Unit]
+Description=LogEmber agent: sources from the hub and heartbeat
+Documentation=https://github.com/overexposed-ltd/logember-agent
+After=network-online.target logember-agent.service
+Wants=network-online.target
+ConditionPathExists=/etc/logember/agent.env
+
+[Service]
+Type=oneshot
+# Root: it writes /etc/logember/sources.yaml and restarts logember-agent.
+EnvironmentFile=/etc/logember/agent.env
+ExecStart=/usr/local/bin/logember-agent-sync
+TimeoutStartSec=3min
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/etc/logember /var/lib/logember

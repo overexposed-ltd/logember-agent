@@ -1,0 +1,431 @@
+#!/bin/sh
+# logember-agent-sync: keeps this host's extra log sources in step with the hub and tells the
+# hub the agent is alive. logember-agent-sync.timer runs it as root every 5 minutes; to run it
+# now: sudo systemctl start logember-agent-sync
+#
+#   1. GET $LOGEMBER_HUB_URL/v1/agent/config with If-None-Match. On 200 the sources become
+#      /etc/logember/sources.yaml (one filelog receiver per path, in a pipeline of their own;
+#      the unit passes the file to the agent as another --config).
+#      If that differs from the current file and passes `logember-agent validate`, it replaces
+#      the file and logember-agent is restarted. 304: nothing to do.
+#   2. POST $LOGEMBER_HUB_URL/v1/agent/heartbeat with the agent version, `systemctl is-active
+#      logember-agent` and the size of the disk buffer.
+#
+# A failed step is logged and makes the run exit 1; the other step still runs. Nothing is
+# logged when nothing changed: the agent ships this journal too.
+#
+# POSIX sh; needs curl, awk and coreutils. Values come from /etc/logember/agent.env, which
+# install.sh writes and the systemd unit loads (EnvironmentFile=).
+
+set -eu
+export LC_ALL=C
+
+SERVICE=logember-agent
+AGENT_USER=logember
+BIN=/usr/local/bin/logember-agent
+CONF_DIR=/etc/logember
+ENV_FILE=$CONF_DIR/agent.env
+SOURCES=$CONF_DIR/sources.yaml
+STATE_DIR=/var/lib/logember
+ETAG_FILE=$STATE_DIR/sources.etag
+BUFFER_DIR=$STATE_DIR/buffer
+# The hub's receivers run in a pipeline of their own, logs/hub, so sources.yaml does not touch
+# the receivers of agent.yaml's logs pipeline (which docker.yaml replaces). logs/hub has the
+# same processors and exporters as that pipeline: keep these in step with agent.yaml
+# (scripts/test-sync.sh checks it).
+PROCESSORS='memory_limiter, resourcedetection, transform/normalize, transform/redact, redaction, redaction/local, batch'
+EXPORTERS='otlphttp'
+
+HUB=""
+WORK=""
+
+usage() {
+  cat <<'USAGE'
+Usage: logember-agent-sync
+
+Fetches this host's log sources from the hub (GET /v1/agent/config) into
+/etc/logember/sources.yaml, restarts logember-agent when they changed, and sends a
+heartbeat (POST /v1/agent/heartbeat). Run as root; normally started every 5 minutes by
+logember-agent-sync.timer (sudo systemctl start logember-agent-sync to run it now).
+USAGE
+}
+
+# Under systemd a <N> prefix sets the journal priority (sd-daemon(3)), so errors reach the hub
+# as errors; run by hand, the messages are plain.
+say() {
+  if [ -n "${JOURNAL_STREAM:-}" ]; then
+    printf '<%s>%s\n' "$1" "$2" >&2
+  else
+    printf 'logember-agent-sync: %s\n' "$2" >&2
+  fi
+}
+info() { say 6 "$*"; }
+warn() { say 4 "warning: $*"; }
+err() { say 3 "error: $*"; }
+
+load_env() {
+  if [ -z "${LOGEMBER_HUB_URL:-}" ] || [ -z "${LOGEMBER_INGEST_KEY:-}" ]; then
+    if [ ! -r "$ENV_FILE" ]; then
+      err "$ENV_FILE not found or not readable: is this host enrolled (install.sh --token ...)?"
+      exit 1
+    fi
+    set -a
+    # shellcheck disable=SC1090 # plain KEY=value lines written by install.sh
+    . "$ENV_FILE"
+    set +a
+  fi
+  HUB=${LOGEMBER_HUB_URL:-}
+  HUB=${HUB%/}
+  case $HUB in
+    http://?* | https://?*) ;;
+    *) err "LOGEMBER_HUB_URL in $ENV_FILE is not an http(s) URL: $HUB"; exit 1 ;;
+  esac
+  # The key goes into a curl config line below: only the characters install.sh accepts.
+  case ${LOGEMBER_INGEST_KEY:-} in
+    '' | *[!A-Za-z0-9._~+/=-]*) err "LOGEMBER_INGEST_KEY in $ENV_FILE is missing or malformed"; exit 1 ;;
+  esac
+}
+
+# hub_request METHOD PATH OUTFILE [curl args]: prints the HTTP status code. The key is passed
+# on stdin (curl -K -), so it never shows up in the process list.
+hub_request() {
+  req_method=$1 req_path=$2 req_out=$3
+  shift 3
+  printf 'header = "Authorization: Bearer %s"\n' "$LOGEMBER_INGEST_KEY" |
+    curl --silent --show-error --proto =http,https --connect-timeout 15 --max-time 60 \
+      -K - -X "$req_method" -H 'Accept: application/json' \
+      --output "$req_out" --write-out '%{http_code}' "$@" "$HUB$req_path"
+}
+
+# ": <message>" from a {"error":{"code","message"}} body, for log lines.
+error_message() {
+  [ -s "$1" ] || return 0
+  sed -n 's/.*"message"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/: \1/p' "$1" | cut -c1-300
+}
+
+# Last value of a response header (curl -D file), case-insensitive name.
+header_value() {
+  tr -d '\r' <"$2" | awk -v name="$1" '
+    index(tolower($0), name ":") == 1 { v = substr($0, length(name) + 2); sub(/^[ \t]+/, "", v); sub(/[ \t]+$/, "", v) }
+    END { print v }'
+}
+
+# Turns the GET /v1/agent/config body into sources.yaml. One filelog receiver per "file"
+# source, named after a hash of its path so its read position (file_storage) survives
+# reordering in the hub; the attribute logember.source.service becomes logember.service in
+# agent.yaml. Sources this agent cannot use are left out, with a line each in -v skipped.
+# Exits 2 on a body that is not the expected JSON.
+# shellcheck disable=SC2016 # awk program, not shell
+SOURCES_AWK='
+function fail(msg) { print "the hub sent invalid JSON: " msg > "/dev/stderr"; exit 2 }
+function ch() { return substr(s, p, 1) }
+function ws() { while (p <= n && index(" \t\r\n", substr(s, p, 1))) p++ }
+function hex4(   h, i, v) {
+  h = substr(s, p, 4)
+  if (h !~ /^[0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f]$/) fail("bad \\u escape at offset " p)
+  v = 0
+  for (i = 1; i <= 4; i++) v = v * 16 + index("0123456789abcdef", tolower(substr(h, i, 1))) - 1
+  p += 4
+  return v
+}
+function utf8(cp) {
+  if (cp == 0) return "\001"   # rejected below as a control character
+  if (cp < 128) return sprintf("%c", cp)
+  if (cp < 2048) return sprintf("%c%c", 192 + int(cp / 64), 128 + cp % 64)
+  if (cp < 65536) return sprintf("%c%c%c", 224 + int(cp / 4096), 128 + int(cp / 64) % 64, 128 + cp % 64)
+  return sprintf("%c%c%c%c", 240 + int(cp / 262144), 128 + int(cp / 4096) % 64, 128 + int(cp / 64) % 64, 128 + cp % 64)
+}
+function parse_string(   out, c, e, cp, lo) {
+  p++
+  out = ""
+  while (1) {
+    if (p > n) fail("unterminated string")
+    c = substr(s, p, 1)
+    if (c == "\"") { p++; return out }
+    if (c != "\\") { out = out c; p++; continue }
+    e = substr(s, p + 1, 1)
+    p += 2
+    if (e == "\"" || e == "\\" || e == "/") out = out e
+    else if (e == "n") out = out "\n"
+    else if (e == "t") out = out "\t"
+    else if (e == "r") out = out "\r"
+    else if (e == "b") out = out "\b"
+    else if (e == "f") out = out "\f"
+    else if (e == "u") {
+      cp = hex4()
+      if (cp >= 55296 && cp < 56320) {
+        if (substr(s, p, 2) != "\\u") fail("lone surrogate at offset " p)
+        p += 2
+        lo = hex4()
+        if (lo < 56320 || lo >= 57344) fail("bad surrogate pair at offset " p)
+        cp = 65536 + (cp - 55296) * 1024 + (lo - 56320)
+      }
+      out = out utf8(cp)
+    } else fail("bad escape at offset " p)
+  }
+}
+function parse_value(path,   c, v) {
+  ws()
+  c = ch()
+  if (c == "{") parse_object(path)
+  else if (c == "[") parse_array(path)
+  else if (c == "\"") { v = parse_string(); val[path] = v; isstr[path] = 1 }
+  else if (match(substr(s, p), /^(true|false|null|-?[0-9]+(\.[0-9]+)?([eE][-+]?[0-9]+)?)/)) { val[path] = substr(s, p, RLENGTH); p += RLENGTH }
+  else fail("unexpected character at offset " p)
+}
+function parse_object(path,   key, c) {
+  isobj[path] = 1
+  p++
+  ws()
+  if (ch() == "}") { p++; return }
+  while (1) {
+    ws()
+    if (ch() != "\"") fail("expected a key at offset " p)
+    key = parse_string()
+    ws()
+    if (ch() != ":") fail("expected : at offset " p)
+    p++
+    parse_value(path "/" key)
+    ws()
+    c = ch()
+    if (c == "}") { p++; return }
+    if (c != ",") fail("expected , or } at offset " p)
+    p++
+  }
+}
+function parse_array(path,   i, c) {
+  isarr[path] = 1
+  arrlen[path] = 0
+  p++
+  ws()
+  if (ch() == "]") { p++; return }
+  for (i = 0; ; i++) {
+    parse_value(path "/" i)
+    arrlen[path] = i + 1
+    ws()
+    c = ch()
+    if (c == "]") { p++; return }
+    if (c != ",") fail("expected , or ] at offset " p)
+    p++
+  }
+}
+# YAML single-quoted scalar; $ is doubled so the collector does not expand ${...} in it.
+function yq(v) {
+  gsub(/\047/, "\047\047", v)
+  gsub(/\$/, "$$", v)
+  return "\047" v "\047"
+}
+function hash(v,   h, i) {
+  h = 0
+  for (i = 1; i <= length(v); i++) h = (h * 31 + ord[substr(v, i, 1)]) % 2147483647
+  return h
+}
+function skip(i, why) { print "source " (i + 1) " skipped: " why > skipped }
+{ s = s $0 "\n" }
+END {
+  for (i = 1; i < 256; i++) ord[sprintf("%c", i)] = i
+  n = length(s)
+  p = 1
+  ws()
+  if (ch() != "{") fail("expected an object")
+  parse_value("")
+  ws()
+  if (p <= n) fail("unexpected data after the object at offset " p)
+  if (!("/sources" in isarr)) fail("no \"sources\" array")
+
+  print "# Written by logember-agent-sync from GET /v1/agent/config: the log sources added in the hub."
+  print "# Replaced whenever they change there, so edits here do not last. The unit passes it to the"
+  print "# agent as a --config after agent.yaml and redaction.yaml."
+  ids = ""
+  for (i = 0; i < arrlen["/sources"]; i++) {
+    k = "/sources/" i
+    type = val[k "/type"]; path = val[k "/path"]; svc = val[k "/service_name"]
+    if (!(k in isobj)) { skip(i, "not an object"); continue }
+    if (type != "file") { skip(i, "type \"" type "\" is not supported by this agent version"); continue }
+    if (!isstr[k "/path"] || path !~ /^\//) { skip(i, "path must be an absolute path, got \"" path "\""); continue }
+    if (path svc ~ /[\001-\037\177]/) { skip(i, "control characters in path or service_name"); continue }
+    if (index(path svc, "EXPR(")) { skip(i, "EXPR( is not allowed in path or service_name"); continue }
+    if (path ~ /^\/var\/log\/(nginx\/)?[^\/]*\.log$/) { skip(i, path " is already read by the default sources"); continue }
+    if (path in seen) { skip(i, "duplicate path " path); continue }
+    seen[path] = 1
+    id = "filelog/hub_" hash(path)
+    while ((id in used)) id = id "_"
+    used[id] = 1
+    if (ids == "") print "receivers:"
+    ids = ids (ids == "" ? "" : ", ") id
+    print "  " id ":"
+    print "    include: [" yq(path) "]"
+    print "    start_at: end"
+    print "    storage: file_storage"
+    print "    include_file_path: true"
+    print "    include_file_name: false"
+    if (svc != "") {
+      print "    attributes:"
+      print "      logember.source.service: " yq(svc)
+    }
+    print "    operators:"
+    print "      - type: filter"
+    print "        expr: \047body matches \"^\\\\s*$\"\047"
+  }
+  if (ids != "") {
+    print "service:"
+    print "  pipelines:"
+    print "    logs/hub:"
+    print "      receivers: [" ids "]"
+    print "      processors: [" processors "]"
+    print "      exporters: [" exporters "]"
+  }
+}'
+
+save_etag() {
+  if [ -n "$1" ]; then
+    printf '%s\n' "$1" >"$ETAG_FILE.tmp" && mv -f "$ETAG_FILE.tmp" "$ETAG_FILE"
+  else
+    rm -f "$ETAG_FILE"
+  fi
+}
+
+sync_config() {
+  etag=""
+  if [ -f "$SOURCES" ] && [ -f "$ETAG_FILE" ]; then
+    etag=$(cat "$ETAG_FILE")
+  fi
+  set --
+  if [ -n "$etag" ]; then
+    set -- -H "If-None-Match: $etag"
+  fi
+  if ! code=$(hub_request GET /v1/agent/config "$WORK/config.json" --dump-header "$WORK/config.headers" "$@"); then
+    err "GET /v1/agent/config: could not reach the hub at $HUB"
+    return 1
+  fi
+  case $code in
+    304) return 0 ;;
+    200) ;;
+    401) err "GET /v1/agent/config: the hub rejected this host's ingest key (HTTP 401); was the host removed in the hub?"; return 1 ;;
+    *) err "GET /v1/agent/config: HTTP $code from $HUB$(error_message "$WORK/config.json")"; return 1 ;;
+  esac
+
+  new_etag=$(header_value etag "$WORK/config.headers")
+  case $new_etag in
+    *[!\ -~]*) new_etag="" ;;
+  esac
+  : >"$WORK/skipped"
+  if ! awk -v processors="$PROCESSORS" -v exporters="$EXPORTERS" -v skipped="$WORK/skipped" "$SOURCES_AWK" \
+    "$WORK/config.json" >"$WORK/sources.yaml" 2>"$WORK/awk.err"; then
+    err "GET /v1/agent/config: $(cat "$WORK/awk.err"); keeping $SOURCES"
+    return 1
+  fi
+
+  if [ -f "$SOURCES" ] && cmp -s "$WORK/sources.yaml" "$SOURCES"; then
+    save_etag "$new_etag"
+    return 0
+  fi
+  # Only the comments differ (install.sh's placeholder, an older agent version): no restart.
+  restart=1
+  if [ -f "$SOURCES" ]; then
+    grep -v '^#' "$SOURCES" >"$WORK/current.config" || true
+    grep -v '^#' "$WORK/sources.yaml" >"$WORK/new.config" || true
+    if cmp -s "$WORK/new.config" "$WORK/current.config"; then
+      restart=0
+    fi
+  fi
+  if [ "$restart" -eq 1 ]; then
+    while IFS= read -r line; do
+      warn "$line"
+    done <"$WORK/skipped"
+    if ! out=$("$BIN" validate --config "$CONF_DIR/agent.yaml" --config "$CONF_DIR/redaction.yaml" \
+      --config "$WORK/sources.yaml" 2>&1); then
+      err "the sources from the hub do not pass logember-agent validate, keeping $SOURCES: $out"
+      return 1
+    fi
+  fi
+  if ! install -m 0640 -o "$AGENT_USER" -g "$AGENT_USER" "$WORK/sources.yaml" "$SOURCES.tmp" ||
+    ! mv -f "$SOURCES.tmp" "$SOURCES"; then
+    err "could not write $SOURCES"
+    return 1
+  fi
+  save_etag "$new_etag"
+  if [ "$restart" -eq 0 ]; then
+    return 0
+  fi
+  count=$(grep -c '^  filelog/hub_' "$SOURCES" || true)
+  if ! systemctl try-restart "$SERVICE"; then
+    err "the files from the hub changed (now $count), but $SERVICE did not restart; see: journalctl -u $SERVICE"
+    return 1
+  fi
+  info "the files from the hub changed (now $count, in $SOURCES); restarted $SERVICE"
+}
+
+# "v0.2.0" from "logember-agent version 0.2.0".
+agent_version() {
+  out=$("$BIN" --version 2>/dev/null) || return 1
+  v=${out##* }
+  v=v${v#v}
+  case $v in
+    v[0-9]*) ;;
+    *) return 1 ;;
+  esac
+  case $v in
+    *[!0-9A-Za-z.+-]*) return 1 ;;
+  esac
+  printf '%s\n' "$v"
+}
+
+# Bytes in the disk buffer; du -k (rounded up to blocks) where du has no -b.
+buffer_bytes() {
+  b=""
+  if [ -d "$BUFFER_DIR" ]; then
+    b=$(du -sb "$BUFFER_DIR" 2>/dev/null | awk '{ print $1 }') || b=""
+    if [ -z "$b" ]; then
+      b=$(du -sk "$BUFFER_DIR" 2>/dev/null | awk '{ print $1 * 1024 }') || b=""
+    fi
+  fi
+  case $b in
+    '' | *[!0-9]*) b=0 ;;
+  esac
+  printf '%s\n' "$b"
+}
+
+heartbeat() {
+  if ! version=$(agent_version); then
+    err "POST /v1/agent/heartbeat: $BIN --version failed; heartbeat not sent"
+    return 1
+  fi
+  status=$(systemctl is-active "$SERVICE" 2>/dev/null) || true
+  case $status in
+    '' | *[!a-z-]*) status=unknown ;;
+  esac
+  body=$(printf '{"agent_version":"%s","status":"%s","buffer_bytes":%s}' "$version" "$status" "$(buffer_bytes)")
+  if ! code=$(hub_request POST /v1/agent/heartbeat "$WORK/heartbeat.json" \
+    -H 'Content-Type: application/json' --data-binary "$body"); then
+    err "POST /v1/agent/heartbeat: could not reach the hub at $HUB"
+    return 1
+  fi
+  case $code in
+    2??) return 0 ;;
+    401) err "POST /v1/agent/heartbeat: the hub rejected this host's ingest key (HTTP 401); was the host removed in the hub?" ;;
+    *) err "POST /v1/agent/heartbeat: HTTP $code from $HUB$(error_message "$WORK/heartbeat.json")" ;;
+  esac
+  return 1
+}
+
+main() {
+  case ${1:-} in
+    '') ;;
+    -h | --help) usage; exit 0 ;;
+    *) usage >&2; exit 2 ;;
+  esac
+  if [ "$(id -u)" -ne 0 ]; then
+    err "run as root: sudo systemctl start logember-agent-sync"
+    exit 1
+  fi
+  load_env
+  WORK=$(mktemp -d)
+  trap 'rm -rf "$WORK"' EXIT
+  rc=0
+  sync_config || rc=1
+  heartbeat || rc=1
+  exit "$rc"
+}
+
+main "$@"
