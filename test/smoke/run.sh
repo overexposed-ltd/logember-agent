@@ -201,7 +201,18 @@ echo "$limits"
 # IOSchedulingClass is shown as a number: 2 is best-effort.
 want="CPUQuotaPerSecUSec=500ms IOSchedulingClass=2 IOSchedulingPriority=7 Nice=19 "
 if [[ $limits == "$want" ]]; then ok "unit limits"; else bad "unit limits: want $want"; fi
-pid=$(on_host systemctl show -p MainPID --value "$SERVICE")
+sync_limits=$(on_host systemctl show -p CPUQuotaPerSecUSec -p Nice -p IOSchedulingClass -p IOSchedulingPriority logember-agent-sync.service | sort | tr '\n' ' ')
+if [[ $sync_limits == "$want" ]]; then ok "logember-agent-sync unit limits"; else bad "logember-agent-sync unit limits: $sync_limits, want $want"; fi
+# What the kernel enforces, not only what the unit asks for: quota and period in microseconds.
+cpu_max=$(on_host cat "/sys/fs/cgroup/system.slice/$SERVICE.service/cpu.max" 2>/dev/null) || cpu_max=""
+if [[ $cpu_max == "50000 100000" ]]; then ok "cpu.max $cpu_max"; else bad "cpu.max is ${cpu_max:-missing}, want 50000 100000"; fi
+# MainPID is 0 while the agent restarts (the first sync may have restarted it just now).
+pid=0
+for _ in $(seq 20); do
+  pid=$(on_host systemctl show -p MainPID --value "$SERVICE") || pid=0
+  [[ $pid != 0 ]] && break
+  sleep 0.5
+done
 # Field 19 of /proc/<pid>/stat is the nice value (Debian 12 has no ps); comm in ( ) may hold spaces.
 nice=$(on_host sh -c "sed 's/.*) //' /proc/$pid/stat | cut -d' ' -f17") || nice=""
 if [[ $nice == 19 ]]; then ok "agent process runs at nice 19"; else bad "agent process nice is ${nice:-unknown}, want 19"; fi

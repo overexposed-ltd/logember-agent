@@ -24,8 +24,10 @@ RestartSec=5
 LimitNOFILE=65536
 MemoryMax=512M
 # The agent shares the host with the applications it watches and must never compete with them:
-# at most half a CPU core, lowest CPU and disk priority. When it is held back, reading slows
-# down and lines wait in the files and the journal (see "Disk buffer" in the README).
+# at most half a CPU core (journalctl, which the journald receiver starts, included), lowest
+# CPU priority, and lowest disk priority where the I/O scheduler honours it (BFQ). When it is
+# held back, reading slows down and lines wait in the files and the journal (see "Disk buffer"
+# in the README).
 CPUQuota=50%
 Nice=19
 IOSchedulingClass=best-effort

@@ -11,6 +11,11 @@ Type=oneshot
 EnvironmentFile=/etc/logember/agent.env
 ExecStart=/usr/local/bin/logember-agent-sync
 TimeoutStartSec=3min
+# Same limits as logember-agent: `logember-agent validate` builds the whole collector config.
+CPUQuota=50%
+Nice=19
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
