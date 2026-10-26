@@ -47,8 +47,7 @@ journalctl --directory=/var/log/journal/fixture --priority=info -q -o cat | grep
 
 # Expected record count: non-empty lines of the files agent.yaml reads (auth.log is excluded)
 # plus journal entries at priority info or higher with a non-empty MESSAGE.
-files=$(find test/fixtures/var/log -name '*.log' ! -name auth.log)
-expected_files=$(cat $files | grep -cv '^\s*$')
+expected_files=$(find test/fixtures/var/log -name '*.log' ! -name auth.log -exec cat {} + | grep -cv '^\s*$')
 expected_journal=$(journalctl --directory=/var/log/journal/fixture --priority=info -q -o cat | grep -cv '^\s*$')
 expected=$((expected_files + expected_journal))
 
@@ -103,6 +102,7 @@ check "record count is $expected" "length == $expected"
 check "every record: logember.service non-empty, <= 128 chars" 'all(.attrs["logember.service"] | type == "string" and length > 0 and length <= 128)'
 check "every record: logember.env = production" 'all(.attrs["logember.env"] == "production")'
 check "every record: severity_text in the schema enum" 'all(.severity_text | IN("trace","debug","info","warn","error","fatal"))'
+# shellcheck disable=SC2016 # $n is a jq variable
 check "every record: severity_number matches severity_text" 'all({"trace":1,"debug":5,"info":9,"warn":13,"error":17,"fatal":21}[.severity_text] as $n | (.severity_number == $n or .severity_number == ($n|tostring)))'
 check "every record: body is a non-empty string" 'all(.body | type == "string" and test("\\S"))'
 check "every record: timestamp set" 'all(.time != "0")'
