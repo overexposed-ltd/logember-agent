@@ -1,19 +1,31 @@
-# ocb manifest: only what config/agent.yaml uses. Pin versions to one Collector release when the first build is made.
+# ocb manifest: only the components config/agent.yaml uses (plus debug exporter for fixture tests).
+# Pinned to one Collector release: core v1.69.0 / v0.163.0, contrib v0.163.0.
+# Bump every gomod line together, and OCB_VERSION in scripts/build.sh with them.
+# dist.version and dist.output_path are set by scripts/build.sh.
 dist:
+  module: github.com/overexposed-ltd/logember-agent
   name: logember-agent
   description: LogEmber agent (OpenTelemetry Collector distribution)
   output_path: ./dist/build
 receivers:
-  - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/receiver/filelogreceiver v0.115.0
-  - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/receiver/journaldreceiver v0.115.0
+  - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/receiver/filelogreceiver v0.163.0
+  - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/receiver/journaldreceiver v0.163.0
 processors:
-  - gomod: go.opentelemetry.io/collector/processor/batchprocessor v0.115.0
-  - gomod: go.opentelemetry.io/collector/processor/memorylimiterprocessor v0.115.0
-  - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/processor/resourcedetectionprocessor v0.115.0
-  - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/processor/transformprocessor v0.115.0
-  - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/processor/redactionprocessor v0.115.0
+  - gomod: go.opentelemetry.io/collector/processor/batchprocessor v0.163.0
+  - gomod: go.opentelemetry.io/collector/processor/memorylimiterprocessor v0.163.0
+  - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/processor/resourcedetectionprocessor v0.163.0
+  - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/processor/transformprocessor v0.163.0
+  - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/processor/redactionprocessor v0.163.0
 exporters:
-  - gomod: go.opentelemetry.io/collector/exporter/otlphttpexporter v0.115.0
+  - gomod: go.opentelemetry.io/collector/exporter/otlphttpexporter v0.163.0
+  - gomod: go.opentelemetry.io/collector/exporter/debugexporter v0.163.0
 extensions:
-  - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/extension/storage/filestorage v0.115.0
-  - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/extension/bearertokenauthextension v0.115.0
+  - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/extension/storage/filestorage v0.163.0
+  - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/extension/bearertokenauthextension v0.163.0
+# Explicit so the set does not change with the ocb default: ${env:...} and file:/path configs only.
+providers:
+  - gomod: go.opentelemetry.io/collector/confmap/provider/envprovider v1.69.0
+  - gomod: go.opentelemetry.io/collector/confmap/provider/fileprovider v1.69.0
+telemetry:
+  gomod: go.opentelemetry.io/collector/service v0.163.0
+  import: go.opentelemetry.io/collector/service/telemetry/otelconftelemetry
