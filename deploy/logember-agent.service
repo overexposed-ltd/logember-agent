@@ -7,7 +7,8 @@ Wants=network-online.target
 Type=simple
 User=logember
 Group=logember
-SupplementaryGroups=systemd-journal adm docker
+# No SupplementaryGroups=: systemd refuses to start when a listed group is missing (e.g. no
+# docker). install.sh adds the user to systemd-journal, adm and docker where they exist.
 EnvironmentFile=/etc/logember/agent.env
 ExecStart=/usr/local/bin/logember-agent --config /etc/logember/agent.yaml
 Restart=always
