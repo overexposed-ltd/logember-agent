@@ -2,7 +2,7 @@
 
 ## Goal
 
-`curl -fsSL https://get.logember.com | sudo sh -s -- --token X` on a clean Ubuntu 24.04 or Debian 12 host (amd64, arm64) installs the agent, enrolls it with the hub, ships journald, /var/log, nginx and Docker container logs over OTLP to ingest, buffers on disk while the network is down, and redacts secrets before anything leaves the host.
+`curl -fsSL https://get.logember.com | sudo bash -s -- --token X` on a clean Ubuntu 24.04 or Debian 12 host (amd64, arm64) installs the agent, enrolls it with the hub, ships journald, /var/log, nginx and Docker container logs over OTLP to ingest, buffers on disk while the network is down, and redacts secrets before anything leaves the host.
 
 ## Cards (in order)
 
@@ -31,17 +31,20 @@ Backlog (starts when its dependencies are done):
 
 v0.1.0 is tagged when 16 is green on all four distro/arch combinations.
 
-## Open questions
+## Decisions
 
-- Default hub and ingest URLs, and whether /v1/enroll and /v1/logs are live there at release time; who serves get.logember.com.
-- .deb/.rpm packages in v0.1.0, or binaries + install.sh only.
-- Docker-only hosts: publish an agent container image, or document "install on the host".
-- Hub config polling (GET /v1/agent/config) and heartbeat: in v0.1.0 or later. No ready OTel component for this API.
-- install.sh shell: `set -euo pipefail` needs bash; `sh` on Debian/Ubuntu is dash.
-- Smoke test target: staging hub/ingest or a mock in CI.
+Made 2026-10-26 on the owner's delegation; they answer the former open questions.
+
+- Default URLs: hub https://app.logember.com, ingest https://ingest.logember.com. get.logember.com is hosted outside this repo and must serve the release asset install.sh.
+- Packaging: raw binaries + checksums.txt + install.sh/uninstall.sh and config files as release assets. No .deb/.rpm, no tarball in v0.1.0.
+- Docker-only hosts: no container image in v0.1.0. Install the agent on the host; container logs are collected from /var/lib/docker/containers.
+- Hub config polling (GET /v1/agent/config) and heartbeat are in v0.1.0, as decided in the monorepo (logember/PLAN.md, Q2): a small POSIX shell script `logember-agent-sync` + systemd timer every 5 minutes (separate card). Redaction rules from the hub are not in v0.1.0; they come only from /etc/logember/redaction.yaml.
+- Shell: install.sh and uninstall.sh are bash with `set -euo pipefail` (`#!/usr/bin/env bash`, shellcheck -s bash); the one-liner is `curl -fsSL https://get.logember.com | sudo bash -s -- --token X`. Run via sh, the scripts stop with a "needs bash" message.
+- Smoke test: self-contained mock in CI (mock POST /v1/enroll + OTLP sink container) on every run; a manual workflow_dispatch job against staging is optional and may stay a stub.
 
 ## Log
 
 - 2026-10-26: plan created; 17 cards on the Kanban board (11 work cards, 6 questions).
 - 2026-10-26: [config] agent.yaml validates and maps journald and file logs onto log-schema.json; scripts/test-config.sh checks it against fixtures. journald is the source for system logs; rsyslog copies in /var/log are not read.
 - 2026-10-26: [docker] Container logs from /var/lib/docker/containers (json-file), service = container name via docker_observer + receiver_creator (config/docker.yaml, loaded only when the Docker API is reachable), else the short container ID; files read with CAP_DAC_READ_SEARCH. The release workflow publishes config/docker.yaml as the `docker.yaml` asset.
+- 2026-10-26: [docs] README matches v0.1.0: install options, files on the host, disk buffer (5000 requests, no byte cap), Docker-only hosts (install on the host, no image), self-hosted hub (--hub/--ingest/--env, POST /v1/enroll, OTLP /v1/logs, TLS via the system CA store), tested platforms (Ubuntu 24.04, Debian 12). Open questions moved to Decisions. Hub config sync is not documented yet; its card adds that.
