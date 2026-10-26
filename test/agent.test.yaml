@@ -1,4 +1,4 @@
-# Overlay for scripts/test-config.sh, merged over config/agent.yaml (--config twice).
+# Overlay for scripts/test-config.sh and test/buffering.sh, merged over config/agent.yaml (--config twice).
 # Reads the fixtures from the beginning and sends OTLP/JSON to test/otlp-sink.py instead of ingest.
 receivers:
   journald:
@@ -8,13 +8,15 @@ receivers:
     start_at: beginning
   filelog/docker:
     start_at: beginning
-processors:
-  batch:
-    timeout: 1s
 extensions:
   file_storage:
     directory: ${env:TEST_WORK}/buffer
+    compaction:
+      directory: ${env:TEST_WORK}/buffer
 exporters:
   otlphttp:
     encoding: json
     compression: none
+    sending_queue:
+      batch:
+        flush_timeout: 1s

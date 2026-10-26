@@ -284,6 +284,18 @@ install_files() {
   fi
   # Forget the ETag, so the first sync after an upgrade writes sources.yaml in this version's format.
   rm -f "$STATE_DIR/sources.etag"
+  # A sources.yaml from an older version names that version's processors; if it no longer passes
+  # with the new agent.yaml, the agent would not start. Start without it until that first sync.
+  # validate needs the ${env:...} values to be set; placeholders do, it only checks the config.
+  validate() {
+    LOGEMBER_INGEST_KEY=validate LOGEMBER_INGEST_URL=$INGEST LOGEMBER_ENV=$ENV_NAME \
+      "$BIN" validate --config "$CONF_DIR/agent.yaml" --config "$CONF_DIR/redaction.yaml" "$@" >/dev/null 2>&1
+  }
+  if validate && ! validate --config "$CONF_DIR/sources.yaml"; then
+    warn "$CONF_DIR/sources.yaml does not fit this version; it is written again by the first sync"
+    echo "# Written by logember-agent-sync from GET /v1/agent/config: no sources from the hub yet." >"$TMP/sources.yaml"
+    put "$TMP/sources.yaml" "$CONF_DIR/sources.yaml" 0640 "$AGENT_USER"
+  fi
   put "$TMP/logember-agent.service" "$UNIT_FILE" 0644 root
   put "$TMP/$SYNC" "$BIN-sync" 0755 root
   put "$TMP/$SYNC.service" "$UNIT_DIR/$SYNC.service" 0644 root
