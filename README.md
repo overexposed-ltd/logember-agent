@@ -30,7 +30,7 @@ Linux amd64 / arm64 with systemd (Debian, Ubuntu, RHEL/Alma/Rocky, Fedora). Dock
 
 ## Development
 
-Requires Go 1.22+ and [ocb](https://opentelemetry.io/docs/collector/custom-collector/). `scripts/build.sh` produces `dist/logember-agent_<os>_<arch>`. Releases are published on GitHub Releases; `install.sh` always fetches the latest tagged version unless `--version` is given.
+Requires Go (any version ≥ 1.21) and curl. `scripts/build.sh` downloads the pinned [ocb](https://opentelemetry.io/docs/collector/custom-collector/) release (checksum-verified), builds with the pinned Go toolchain via `GOTOOLCHAIN`, and produces `dist/logember-agent_linux_{amd64,arm64}` plus `dist/checksums.txt`. Set `VERSION` to override the version taken from `git describe --tags`. Releases are published on GitHub Releases; `install.sh` always fetches the latest tagged version unless `--version` is given.
 
 The wire format and the record schema live in the main LogEmber repo under `proto/`.
 
