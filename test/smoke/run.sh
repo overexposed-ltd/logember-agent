@@ -195,6 +195,17 @@ echo "$state"
 [[ $state == active ]] || die "$SERVICE is ${state:-unknown}"
 on_host systemctl status "$SERVICE" --no-pager -n 0 || true
 
+step "CPU and disk limits of $SERVICE"
+limits=$(on_host systemctl show -p CPUQuotaPerSecUSec -p Nice -p IOSchedulingClass -p IOSchedulingPriority "$SERVICE" | sort | tr '\n' ' ')
+echo "$limits"
+# IOSchedulingClass is shown as a number: 2 is best-effort.
+want="CPUQuotaPerSecUSec=500ms IOSchedulingClass=2 IOSchedulingPriority=7 Nice=19 "
+if [[ $limits == "$want" ]]; then ok "unit limits"; else bad "unit limits: want $want"; fi
+pid=$(on_host systemctl show -p MainPID --value "$SERVICE")
+# Field 19 of /proc/<pid>/stat is the nice value (Debian 12 has no ps); comm in ( ) may hold spaces.
+nice=$(on_host sh -c "sed 's/.*) //' /proc/$pid/stat | cut -d' ' -f17") || nice=""
+if [[ $nice == 19 ]]; then ok "agent process runs at nice 19"; else bad "agent process nice is ${nice:-unknown}, want 19"; fi
+
 step "Enrollment"
 enroll=$(tail -n 1 "$WORK/hub/enroll.jsonl" 2>/dev/null) || enroll=""
 if jq -e --arg arch "$ARCH" --arg v "$VERSION" --arg host "$HOSTNAME_" --arg os "$OS_NAME" \
