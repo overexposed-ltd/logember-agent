@@ -3,12 +3,12 @@
 The agent that ships your servers' logs to [LogEmber](https://logember.com). It is a thin wrapper around the [OpenTelemetry Collector](https://opentelemetry.io/docs/collector/): one binary, one config file, one systemd unit. Everything it sends is visible in `config/agent.yaml`, and everything it redacts before sending is visible in `config/redaction.yaml`.
 
 ```bash
-curl -fsSL https://get.logember.com | sudo sh -s -- --token <ENROLLMENT_TOKEN>
+curl -fsSL https://get.logember.com | sudo bash -s -- --token <ENROLLMENT_TOKEN>
 ```
 
 ## What it does
 
-1. On first start it exchanges the one-time enrollment token for a per-host ingest key (`POST /v1/enroll`), stored in `/etc/logember/credentials` (mode 600).
+1. On the first install, `install.sh` exchanges the one-time enrollment token for a per-host ingest key (`POST /v1/enroll`), stored as `LOGEMBER_INGEST_KEY` in `/etc/logember/agent.env` (mode 600, read by systemd as the unit's `EnvironmentFile`). Re-running the script upgrades the agent and keeps the key; `--help` lists the options.
 2. It tails `journald`, `/var/log/*.log`, `/var/log/nginx/*.log` and Docker containers (when `/var/run/docker.sock` exists). Files that rsyslog copies from journald (`/var/log/syslog`, `auth.log`, `kern.log`, ...) are skipped so nothing is sent twice. Extra paths come from the hub (`GET /v1/agent/config`, polled every 5 minutes).
 3. Each line gets `host`, `service` (systemd unit, program name, file path or container name; `unknown` if none), `env` and a `severity` (`trace`…`fatal`, from the journald priority, a JSON `level` field or the text of the line). JSON lines are unpacked into attributes (flattened, lowercase dotted keys, string values, at most 64).
 4. Secrets are redacted on the host, before anything leaves it: bearer tokens, `password=…`, AWS keys, card numbers, plus your own rules.
