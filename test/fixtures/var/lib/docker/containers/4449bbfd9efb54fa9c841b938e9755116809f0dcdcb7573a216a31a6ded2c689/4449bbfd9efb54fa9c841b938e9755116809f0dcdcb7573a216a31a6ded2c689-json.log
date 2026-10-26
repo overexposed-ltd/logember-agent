@@ -1,0 +1,6 @@
+{"log":"172.17.0.1 - - [26/Oct/2026:12:00:30 +0000] \"GET / HTTP/1.1\" 200 615 \"-\" \"curl/8.5.0\" \"-\"\n","stream":"stdout","time":"2026-10-26T12:00:30.123456789Z"}
+{"log":"2026/10/26 12:00:31 [notice] 1#1: start worker processes\n","stream":"stderr","time":"2026-10-26T12:00:31.5Z"}
+{"log":"\n","stream":"stdout","time":"2026-10-26T12:00:32Z"}
+{"log":"{\"level\":\"error\",\"msg\":\"container job failed\",\"job\":\"export\"}\n","stream":"stdout","time":"2026-10-26T12:00:33.25Z"}
+{"log":"first half of a line over 16 KiB, ","stream":"stdout","time":"2026-10-26T12:00:34Z"}
+{"log":"second half\n","stream":"stdout","time":"2026-10-26T12:00:34Z"}

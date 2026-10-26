@@ -6,6 +6,8 @@ receivers:
     start_at: beginning
   filelog:
     start_at: beginning
+  filelog/docker:
+    start_at: beginning
 processors:
   batch:
     timeout: 1s

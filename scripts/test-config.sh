@@ -4,9 +4,10 @@
 # (proto/log-schema.json in the main repo), and that no secret from the redaction fixtures leaves it.
 #
 # The agent runs in a throwaway Debian 12 container: the fixtures are copied into the real
-# /var/log there (so the include/exclude paths of agent.yaml are tested as they are), the journal
-# export is turned into a journal file for the journald receiver, and test/agent.test.yaml points
-# the exporter at test/otlp-sink.py, which writes the OTLP/JSON requests to a file for jq.
+# /var/log and /var/lib/docker/containers there (so the include/exclude paths of agent.yaml are
+# tested as they are), the journal export is turned into a journal file for the journald
+# receiver, and test/agent.test.yaml points the exporter at test/otlp-sink.py, which writes the
+# OTLP/JSON requests to a file for jq.
 #
 # Needs: docker, jq, and dist/logember-agent_linux_${ARCH:-amd64} from scripts/build.sh.
 set -euo pipefail
@@ -38,20 +39,26 @@ records="$TEST_WORK/records.jsonl"
 echo "== validate"
 "$bin" validate --config config/agent.yaml
 "$bin" validate --config config/agent.yaml --config config/redaction.yaml
+"$bin" validate --config config/agent.yaml --config config/redaction.yaml --config config/docker.yaml
 
 echo "== fixtures"
 # the image's own apt/dpkg logs would be read too: start from an empty /var/log
 rm -rf /var/log/*
 cp -r test/fixtures/var/log/. /var/log/
+# Docker json-file logs; without a Docker API (as here) the service is the short container ID
+mkdir -p /var/lib/docker
+cp -r test/fixtures/var/lib/docker/containers /var/lib/docker/
 mkdir -p /var/log/journal/fixture "$TEST_WORK/buffer"
 /lib/systemd/systemd-journal-remote -o /var/log/journal/fixture/fixture.journal test/fixtures/journal.export 2>/dev/null
 journalctl --directory=/var/log/journal/fixture --priority=info -q -o cat | grep -c . | sed 's/^/journal entries (priority <= info, incl. empty): /'
 
-# Expected record count: non-empty lines of the files agent.yaml reads (auth.log is excluded)
+# Expected record count: non-empty lines of the files agent.yaml reads (auth.log is excluded),
+# plus Docker entries that end a non-empty line (a line Docker split ends in the entry with "\n"),
 # plus journal entries at priority info or higher with a non-empty MESSAGE.
 expected_files=$(find test/fixtures/var/log -name '*.log' ! -name auth.log -exec cat {} + | grep -cv '^\s*$')
+expected_docker=$(find test/fixtures/var/lib/docker/containers -name '*-json.log' -exec cat {} + | jq -s 'map(select(.log | endswith("\n") and test("\\S"))) | length')
 expected_journal=$(journalctl --directory=/var/log/journal/fixture --priority=info -q -o cat | grep -cv '^\s*$')
-expected=$((expected_files + expected_journal))
+expected=$((expected_files + expected_docker + expected_journal))
 
 echo "== run (expecting $expected records)"
 python3 test/otlp-sink.py 4318 "$out" "$LOGEMBER_INGEST_KEY" &
@@ -140,6 +147,14 @@ check "JSON log.level debug -> debug" "$(rec 'contains("ecs debug")') | .severit
 check "JSON without a level field -> guessed from the line" "$(rec 'contains("no level field")') | .severity_text == \"error\" and .attrs.detail == \"ERROR budget exceeded\""
 check "invalid JSON -> plain line" "$(rec 'startswith("{\"broken\"")') | .severity_text == \"info\" and .attrs[\"logember.service\"] == \"app\""
 check "JSON with 82 fields -> 64 attributes incl. logember.*" "$(rec 'contains("\"wide\"")') | (.attrs | length) == 64 and .attrs[\"logember.service\"] == \"app\" and .attrs[\"logember.env\"] == \"production\""
+
+# Docker (json-file, no Docker API: service is the short container ID)
+cid=4449bbfd9efb54fa9c841b938e9755116809f0dcdcb7573a216a31a6ded2c689
+check "docker: every record has service = short container ID, container.id, stream" "map(select(.attrs[\"log.file.path\"] // \"\" | startswith(\"/var/lib/docker/\"))) | length == 4 and all(.attrs[\"logember.service\"] == \"${cid:0:12}\" and .attrs[\"container.id\"] == \"$cid\" and (.attrs.stream | IN(\"stdout\", \"stderr\")))"
+check "docker: nginx access line unwrapped from the JSON, stdout, info, fields" "$(rec 'startswith("172.17.0.1 ")') | .body == \"172.17.0.1 - - [26/Oct/2026:12:00:30 +0000] \\\"GET / HTTP/1.1\\\" 200 615 \\\"-\\\" \\\"curl/8.5.0\\\" \\\"-\\\"\" and .attrs.stream == \"stdout\" and .severity_text == \"info\" and .attrs[\"http.response.status_code\"] == \"200\""
+check "docker: stderr, [notice] -> info, time from the Docker entry" "$(rec 'contains("start worker processes")') | .attrs.stream == \"stderr\" and .severity_text == \"info\" and .time == $(ns 2026-10-26T12:00:31Z 500000000) and (.attrs | has(\"time\") or has(\"log\") | not)"
+check "docker: JSON line with level=error -> error, fields as attributes" "$(rec 'contains("container job failed")') | .severity_text == \"error\" and .attrs.job == \"export\" and .time == $(ns 2026-10-26T12:00:33Z 250000000)"
+check "docker: line split by Docker -> one record" "$(rec 'startswith("first half")') | .body == \"first half of a line over 16 KiB, second half\""
 
 # journald
 check "journald nginx.service -> nginx, PRIORITY 3 -> error" "$(rec 'contains("bind() to 0.0.0.0:80")') | .attrs[\"logember.service\"] == \"nginx\" and .severity_text == \"error\" and .attrs[\"systemd.unit\"] == \"nginx.service\" and .time == $(ns 2026-10-26T12:00:20Z 000000000)"

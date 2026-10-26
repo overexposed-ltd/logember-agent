@@ -1,6 +1,7 @@
 [Unit]
 Description=LogEmber agent (OpenTelemetry Collector)
-After=network-online.target
+# docker.service: at boot, the Docker API is up before the check in ExecStart (no-op without Docker).
+After=network-online.target docker.service
 Wants=network-online.target
 
 [Service]
@@ -10,11 +11,23 @@ Group=logember
 # No SupplementaryGroups=: systemd refuses to start when a listed group is missing (e.g. no
 # docker). install.sh adds the user to systemd-journal, adm and docker where they exist.
 EnvironmentFile=/etc/logember/agent.env
-ExecStart=/usr/local/bin/logember-agent --config /etc/logember/agent.yaml --config /etc/logember/redaction.yaml
+# docker.yaml (container names from the Docker API) is added only when the Docker socket exists
+# and this user may use it: its docker_observer would otherwise stop the agent from starting.
+# Without it, container logs are still read and named by their short container ID.
+ExecStart=/bin/sh -c 'set -- --config /etc/logember/agent.yaml --config /etc/logember/redaction.yaml; if [ -S /run/docker.sock ] && [ -w /run/docker.sock ] && [ -f /etc/logember/docker.yaml ]; then set -- "$$@" --config /etc/logember/docker.yaml; fi; exec /usr/local/bin/logember-agent "$$@"'
+# The journal would otherwise name the agent's own lines after ExecStart's /bin/sh.
+SyslogIdentifier=logember-agent
 Restart=always
 RestartSec=5
 LimitNOFILE=65536
 MemoryMax=512M
+# Docker container logs (/var/lib/docker/containers: root 0710, files root 0640) are not readable
+# through any group. CAP_DAC_READ_SEARCH lets the agent read and list files whatever their
+# permissions; it grants no write access and no other capability. The paths below hold
+# credentials the agent never needs, so they stay out of reach.
+AmbientCapabilities=CAP_DAC_READ_SEARCH
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH
+InaccessiblePaths=-/etc/shadow -/etc/gshadow -/etc/sudoers -/etc/sudoers.d -/etc/ssh
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true

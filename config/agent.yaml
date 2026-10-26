@@ -5,7 +5,7 @@
 #   body                          the raw line (journald: MESSAGE), never empty
 #   time                          from the line when it carries one, else the time the agent read it
 #   severity_text                 one of trace|debug|info|warn|error|fatal, severity_number to match
-#   attributes["logember.service"] unit, program, /var/log/<dir>/ or file name; "unknown" if none
+#   attributes["logember.service"] unit, program, /var/log/<dir>/ or file name, container name; "unknown" if none
 #   attributes["logember.env"]     $LOGEMBER_ENV
 #   other attributes              flattened JSON fields etc.: lowercase dotted keys, string values, max 64
 #   resource host.name            from resourcedetection
@@ -15,6 +15,11 @@
 # /var/log/syslog, auth.log, kern.log, ... so those files are NOT read; reading them too
 # would ship every system line twice. /var/log/*.log still catches files that applications
 # write themselves (dpkg.log, cloud-init.log, fail2ban.log, ...), which are not in journald.
+#
+# Docker: container logs are read from the json-file log driver's files (the Docker default).
+# config/docker.yaml is merged over this file when the agent can reach the Docker API, and then
+# names each container (see deploy/logember-agent.service); without it, the short container ID
+# is the service. Without Docker the glob below matches nothing and the agent stays quiet.
 receivers:
   journald:
     # No `directory`: journalctl then reads both /var/log/journal (persistent) and /run/log/journal.
@@ -45,6 +50,41 @@ receivers:
     include_file_path: true
     include_file_name: false
     operators:
+      - type: filter
+        expr: 'body matches "^\\s*$"'
+  # Replaced by receiver_creator/docker in config/docker.yaml; keep the operators the same in both.
+  filelog/docker:
+    include:
+      - /var/lib/docker/containers/*/*-json.log
+    start_at: end
+    storage: file_storage
+    include_file_path: true
+    include_file_name: false
+    operators:
+      # One JSON object per line: {"log":"GET / HTTP/1.1 200\n","stream":"stdout","time":"2026-10-26T12:00:00.123456789Z"}
+      - type: json_parser
+        on_error: send_quiet
+        timestamp:
+          parse_from: attributes.time
+          layout_type: gotime
+          layout: '2006-01-02T15:04:05.999999999Z07:00'
+      # Docker splits lines longer than 16 KiB into several entries; only the last one ends with "\n".
+      - type: recombine
+        if: 'attributes.log != nil'
+        combine_field: attributes.log
+        combine_with: ""
+        is_last_entry: 'attributes.log endsWith "\n"'
+        max_log_size: 1MiB
+      - type: move
+        if: 'attributes.log != nil'
+        from: attributes.log
+        to: body
+      - type: add
+        field: body
+        value: 'EXPR(trimSuffix(trimSuffix(body, "\n"), "\r"))'
+      - type: remove
+        if: 'attributes.time != nil'
+        field: attributes.time
       - type: filter
         expr: 'body matches "^\\s*$"'
 
@@ -91,6 +131,13 @@ processors:
           - 'set(cache["ts"], cache["syslog"]["ts"]) where IsMatch(cache["syslog"]["ts"], "^\\d{4}-")'
           # /var/log/nginx/error.log -> nginx
           - 'set(attributes["logember.service"], ExtractPatterns(attributes["log.file.path"], "^/var/log/(?P<dir>[^/]+)/")["dir"]) where IsMatch(attributes["log.file.path"], "^/var/log/[^/]+/")'
+          # Docker container -> the container name (resource attribute from receiver_creator/docker), else the short container ID
+          - 'set(cache["docker"], ExtractPatterns(attributes["log.file.path"], "^/var/lib/docker/containers/(?P<id>[0-9a-f]{64})/[0-9a-f]{64}-json\\.log$")) where attributes["log.file.path"] != nil'
+          - 'set(attributes["container.id"], cache["docker"]["id"]) where IsString(cache["docker"]["id"])'
+          - 'set(attributes["logember.service"], Substring(cache["docker"]["id"], 0, 12)) where IsString(cache["docker"]["id"])'
+          - 'set(attributes["container.image.name"], resource.attributes["container.image.name"]) where IsString(cache["docker"]["id"]) and IsString(resource.attributes["container.image.name"])'
+          - 'set(attributes["container.name"], resource.attributes["container.name"]) where IsString(cache["docker"]["id"]) and IsString(resource.attributes["container.name"])'
+          - 'set(attributes["logember.service"], attributes["container.name"]) where IsString(attributes["container.name"]) and attributes["container.name"] != ""'
 
           # --- access logs (nginx/apache combined or common format): fields, time, severity from status ---
           - 'set(cache["http"], ExtractPatterns(body, "^(?P<client>\\S+) \\S+ \\S+ \\[(?P<ts>[^\\]]+)\\] \"(?P<method>[A-Z]+) (?P<path>\\S+)[^\"]*\" (?P<status>\\d{3}) (?P<size>\\d+|-)(?: \"(?P<referer>[^\"]*)\" \"(?P<ua>[^\"]*)\")?")) where attributes["log.file.path"] != nil'
@@ -249,7 +296,7 @@ service:
   extensions: [file_storage, bearertokenauth]
   pipelines:
     logs:
-      receivers: [journald, filelog]
+      receivers: [journald, filelog, filelog/docker]   # config/docker.yaml restates this list
       processors: [memory_limiter, resourcedetection, transform/normalize, transform/redact, redaction, redaction/local, batch]
       exporters: [otlphttp]
   telemetry:

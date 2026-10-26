@@ -84,13 +84,14 @@ jobs:
           agent="dist/logember-agent_linux_$(dpkg --print-architecture)"
           "$agent" validate --config config/agent.yaml
           "$agent" validate --config config/agent.yaml --config config/redaction.yaml
+          "$agent" validate --config config/agent.yaml --config config/redaction.yaml --config config/docker.yaml
 
       # Flat asset names: install.sh downloads <base>/download/<tag>/<asset>.
       - name: Collect assets and write checksums.txt
         run: |
           mkdir -p "$RUNNER_TEMP/release"
           for f in dist/logember-agent_linux_amd64 dist/logember-agent_linux_arm64 \
-            config/agent.yaml config/redaction.yaml deploy/logember-agent.service \
+            config/agent.yaml config/redaction.yaml config/docker.yaml deploy/logember-agent.service \
             install.sh uninstall.sh; do
             [[ -f $f ]] || { echo "::error::$f is missing; every release needs it"; exit 1; }
             cp "$f" "$RUNNER_TEMP/release/"

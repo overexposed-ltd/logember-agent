@@ -117,6 +117,7 @@ jobs:
           "$agent" --version
           "$agent" validate --config config/agent.yaml
           "$agent" validate --config config/agent.yaml --config config/redaction.yaml
+          "$agent" validate --config config/agent.yaml --config config/redaction.yaml --config config/docker.yaml
 
       # Runs the agent on test/fixtures in a Debian 12 container and checks every record it sends.
       - name: scripts/test-config.sh
