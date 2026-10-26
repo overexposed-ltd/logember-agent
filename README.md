@@ -24,7 +24,7 @@ The hub is contacted by `install.sh`, for enrollment, and every 5 minutes by `lo
 |---|---|---|
 | `--token TOKEN` | | Enrollment token. Required on the first install and with `--reenroll`. |
 | `--version vX.Y.Z` | `latest` | Release to install, e.g. `v0.1.0`. `latest` is the newest release that is not a pre-release. |
-| `--hub URL` | `https://app.logember.com` | Hub to enroll with (see [Self-hosted hub](#self-hosted-hub)). |
+| `--hub URL` | `https://api.logember.com` | Hub to enroll with (see [Self-hosted hub](#self-hosted-hub)). |
 | `--ingest URL` | `https://ingest.logember.com` | Where logs are sent. |
 | `--env NAME` | `production` | Value of `logember.env` on every record. Letters, digits, `.`, `_`, `-`. |
 | `--reenroll` | | Enroll again even though the host already has an ingest key. |
@@ -95,7 +95,7 @@ Every 5 minutes `logember-agent-sync.timer` runs `/usr/local/bin/logember-agent-
 
 ## Self-hosted hub
 
-By default the agent enrolls with `https://app.logember.com` and sends to `https://ingest.logember.com`. To use your own hub and ingest, pass both URLs on the first install:
+By default the agent enrolls with `https://api.logember.com` and sends to `https://ingest.logember.com`. To use your own hub and ingest, pass both URLs on the first install:
 
 ```bash
 curl -fsSL https://get.logember.com | sudo bash -s -- --token <ENROLLMENT_TOKEN> \

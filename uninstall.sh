@@ -174,7 +174,7 @@ main() {
   fi
   echo
   echo "This host is still registered in LogEmber and its ingest key has not been revoked."
-  echo "Remove the host in the hub (${HUB:-https://app.logember.com}) to revoke the key."
+  echo "Remove the host in the hub (${HUB:-https://api.logember.com}) to revoke the key."
 }
 
 main "$@"
