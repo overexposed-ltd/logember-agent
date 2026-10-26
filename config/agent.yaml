@@ -271,16 +271,27 @@ processors:
     allow_all_keys: true
     blocked_values: []
     summary: silent
-  batch:
-    send_batch_size: 8192
-    send_batch_max_size: 16384
-    timeout: 5s
 
 extensions:
+  # Holds the receivers' read positions (journald cursor, file offsets) and the sending queue,
+  # one bbolt file each. Only the queue file grows; the others stay at a few KiB.
   file_storage:
     directory: /var/lib/logember/buffer
     create_directory: true   # /var/lib/logember itself comes from StateDirectory= in the unit
     timeout: 10s
+    # Hard limit per file (1 GiB). The queue's own limit (sending_queue.queue_size) is reached
+    # first; this one only matters if bbolt's overhead is far above what was measured.
+    max_size: 1073741824
+    compaction:
+      # bbolt files never shrink by themselves: once the queue has drained below 10 MiB after
+      # having grown past 100 MiB, rewrite the file to give the space back. The temporary copy
+      # is written next to it (/tmp is read-only under ProtectSystem=strict) and is at most the
+      # size of what is still queued, i.e. under 10 MiB.
+      directory: /var/lib/logember/buffer
+      on_rebound: true
+      rebound_needed_threshold_mib: 100
+      rebound_trigger_threshold_mib: 10
+      cleanup_on_start: true
   bearertokenauth:
     token: "${env:LOGEMBER_INGEST_KEY}"
 
@@ -289,15 +300,46 @@ exporters:
     endpoint: "${env:LOGEMBER_INGEST_URL}"   # https://ingest.logember.com
     compression: zstd
     auth: { authenticator: bearertokenauth }
+    # Disk buffer: every record is written to the queue on disk before the receivers move on, and
+    # leaves it only once ingest has accepted it, so an outage or a restart loses nothing
+    # (test/buffering.sh). Delivery is at-least-once: a request ingest accepted just before the
+    # agent was killed is sent again after the restart.
+    #
+    # Disk use: /var/lib/logember/buffer stays under 1 GiB (file_storage max_size; the read
+    # positions add a few KiB). queue_size counts the uncompressed OTLP bytes of the queued
+    # records and is the limit reached first; the bbolt file around them is larger by up to 16 MiB
+    # plus page overhead, which is why the file limit has headroom.
+    #
+    # When the queue is full (ingest unreachable for long enough to queue 512 MiB), the agent
+    # drops nothing itself, neither oldest nor newest: block_on_overflow makes the receivers wait,
+    # so the agent stops reading and new lines stay in the log files and the journal. Once ingest
+    # is back the queue drains oldest first and reading resumes where it stopped. Lines are lost
+    # only when they are gone from the source by then (a file rotated to a name the include
+    # patterns do not match, journald vacuuming old entries), or, if the agent is stopped while
+    # the queue is full, the one batch each receiver was waiting to enqueue (up to 100 lines,
+    # logged as "ConsumeLogs() failed ... context canceled"). Waiting is not logged; the queue
+    # fill level is in the agent's metrics on localhost:8888 (otelcol_exporter_queue_size against
+    # otelcol_exporter_queue_capacity). A write the storage refuses (disk full, max_size reached)
+    # drops that batch and is logged as an error ("ConsumeLogs() failed").
     sending_queue:
       enabled: true
       storage: file_storage
-      queue_size: 5000
+      sizer: bytes
+      queue_size: 536870912   # 512 MiB of uncompressed OTLP (roughly 1-2 million log lines)
+      block_on_overflow: true
+      # Batching happens here, after the disk queue, instead of in a batch processor: a batch
+      # processor keeps records in memory for up to its timeout after the receivers have saved
+      # their read positions, and those records are lost if the agent is killed.
+      batch:
+        sizer: items
+        min_size: 8192
+        max_size: 16384
+        flush_timeout: 5s
     retry_on_failure:
       enabled: true
       initial_interval: 5s
       max_interval: 60s
-      max_elapsed_time: 0   # never drop; the disk queue bounds it
+      max_elapsed_time: 0   # retry forever; 429/503 wait for Retry-After when ingest sends one
 
 service:
   extensions: [file_storage, bearertokenauth]
@@ -306,7 +348,7 @@ service:
       receivers: [journald, filelog, filelog/docker]   # config/docker.yaml restates this list
       # sources.yaml adds a pipeline logs/hub with the hub's receivers and these processors and
       # exporters: change PROCESSORS and EXPORTERS in deploy/logember-agent-sync with them.
-      processors: [memory_limiter, resourcedetection, transform/normalize, transform/redact, redaction, redaction/local, batch]
+      processors: [memory_limiter, resourcedetection, transform/normalize, transform/redact, redaction, redaction/local]
       exporters: [otlphttp]
   telemetry:
     logs: { level: warn }

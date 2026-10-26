@@ -126,3 +126,8 @@ jobs:
       # Runs logember-agent-sync against a mock hub, then the agent on the sources.yaml it wrote.
       - name: scripts/test-sync.sh
         run: ARCH="$(dpkg --print-architecture)" scripts/test-sync.sh
+
+      # Network loss: sink down (1 minute here, 10 in the full run), agent restarts, 429/503, full queue.
+      - name: test/buffering.sh
+        if: hashFiles('test/buffering.sh') != ''
+        run: ARCH="$(dpkg --print-architecture)" OUTAGE=60 test/buffering.sh

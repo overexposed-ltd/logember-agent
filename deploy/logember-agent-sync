@@ -33,7 +33,7 @@ BUFFER_DIR=$STATE_DIR/buffer
 # the receivers of agent.yaml's logs pipeline (which docker.yaml replaces). logs/hub has the
 # same processors and exporters as that pipeline: keep these in step with agent.yaml
 # (scripts/test-sync.sh checks it).
-PROCESSORS='memory_limiter, resourcedetection, transform/normalize, transform/redact, redaction, redaction/local, batch'
+PROCESSORS='memory_limiter, resourcedetection, transform/normalize, transform/redact, redaction, redaction/local'
 EXPORTERS='otlphttp'
 
 HUB=""
