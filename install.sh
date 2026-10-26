@@ -10,8 +10,8 @@
 # redaction rules) is written once and never overwritten. See --help for all options.
 #
 # Release assets used: checksums.txt, logember-agent_linux_{amd64,arm64}, agent.yaml,
-# redaction.yaml, logember-agent.service. Everything runs from main() on the last line, so a download
-# cut short by the network runs nothing.
+# redaction.yaml, docker.yaml, logember-agent.service. Everything runs from main() on the
+# last line, so a download cut short by the network runs nothing.
 
 # This check must stay POSIX: `sh` on Debian/Ubuntu is dash, which stops here.
 if [ -z "${BASH_VERSION:-}" ]; then
@@ -33,6 +33,8 @@ ENV_FILE="$CONF_DIR/agent.env"
 UNIT_FILE="/etc/systemd/system/$SERVICE.service"
 STATE_DIR="/var/lib/logember"
 # Groups whose logs the agent reads; the user joins the ones that exist on this host.
+# docker gives access to the Docker API, which names containers (see docker.yaml); the log
+# files themselves are read with CAP_DAC_READ_SEARCH from the unit.
 READ_GROUPS=(systemd-journal adm docker)
 
 TOKEN=""
@@ -228,7 +230,7 @@ download_release() {
     ASSET_URL=$base/download/$VERSION
   fi
 
-  local asset assets=("logember-agent_linux_$ARCH" agent.yaml redaction.yaml logember-agent.service)
+  local asset assets=("logember-agent_linux_$ARCH" agent.yaml redaction.yaml docker.yaml logember-agent.service)
   info "Downloading logember-agent $VERSION (linux/$ARCH) from $ASSET_URL"
   download checksums.txt
   for asset in "${assets[@]}"; do
@@ -262,6 +264,7 @@ install_files() {
 
   put "$TMP/logember-agent_linux_$ARCH" "$BIN" 0755 root
   put "$TMP/agent.yaml" "$CONF_DIR/agent.yaml" 0640 "$AGENT_USER"
+  put "$TMP/docker.yaml" "$CONF_DIR/docker.yaml" 0640 "$AGENT_USER"
   # The host's own rules (the unit's second --config): only written if missing, never replaced.
   if [[ ! -f $CONF_DIR/redaction.yaml ]]; then
     put "$TMP/redaction.yaml" "$CONF_DIR/redaction.yaml" 0640 "$AGENT_USER"

@@ -1,0 +1,69 @@
+# LogEmber agent: Docker overlay, merged over agent.yaml (`--config agent.yaml --config docker.yaml`).
+#
+# The json-file logs under /var/lib/docker/containers do not say which container wrote them, so
+# agent.yaml can only name a container by its short ID. With this overlay docker_observer watches
+# the Docker API, and receiver_creator starts one filelog receiver per running container, which
+# tags its records with container.name and container.image.name; transform/normalize in
+# agent.yaml then uses the container name as logember.service.
+#
+# docker_observer fails the whole agent at startup when the Docker API is unreachable, so the
+# systemd unit only passes this file when /run/docker.sock exists and the agent may write to it
+# (the logember user is in the docker group; install.sh adds it when the group exists).
+#
+# Containers started while the agent runs: their receiver starts about a second after the
+# container, and lines written in that second are not read (start_at: end, as everywhere else).
+extensions:
+  docker_observer:
+    endpoint: unix:///run/docker.sock
+    # A port-less endpoint per container; the rule below matches only those (port == 0), so a
+    # container that exposes several ports still gets exactly one receiver.
+    include_all_containers: true
+
+receivers:
+  receiver_creator/docker:
+    watch_observers: [docker_observer]
+    receivers:
+      filelog/docker:
+        rule: type == "container" and port == 0
+        # Default resource attributes for containers: container.name and container.image.name.
+        config:
+          include:
+            - '/var/lib/docker/containers/`container_id`/`container_id`-json.log'
+          start_at: end
+          storage: file_storage
+          include_file_path: true
+          include_file_name: false
+          # Same operators as filelog/docker in agent.yaml.
+          operators:
+            - type: json_parser
+              on_error: send_quiet
+              timestamp:
+                parse_from: attributes.time
+                layout_type: gotime
+                layout: '2006-01-02T15:04:05.999999999Z07:00'
+            - type: recombine
+              if: 'attributes.log != nil'
+              combine_field: attributes.log
+              combine_with: ""
+              is_last_entry: 'attributes.log endsWith "\n"'
+              max_log_size: 1MiB
+            - type: move
+              if: 'attributes.log != nil'
+              from: attributes.log
+              to: body
+            - type: add
+              field: body
+              value: 'EXPR(trimSuffix(trimSuffix(body, "\n"), "\r"))'
+            - type: remove
+              if: 'attributes.time != nil'
+              field: attributes.time
+            - type: filter
+              expr: 'body matches "^\\s*$"'
+
+# Lists are replaced, not merged: these restate agent.yaml's lists, with receiver_creator/docker
+# in place of filelog/docker.
+service:
+  extensions: [file_storage, bearertokenauth, docker_observer]
+  pipelines:
+    logs:
+      receivers: [journald, filelog, receiver_creator/docker]

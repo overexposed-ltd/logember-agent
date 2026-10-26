@@ -44,3 +44,4 @@ v0.1.0 is tagged when 16 is green on all four distro/arch combinations.
 
 - 2026-10-26: plan created; 17 cards on the Kanban board (11 work cards, 6 questions).
 - 2026-10-26: [config] agent.yaml validates and maps journald and file logs onto log-schema.json; scripts/test-config.sh checks it against fixtures. journald is the source for system logs; rsyslog copies in /var/log are not read.
+- 2026-10-26: [docker] Container logs from /var/lib/docker/containers (json-file), service = container name via docker_observer + receiver_creator (config/docker.yaml, loaded only when the Docker API is reachable), else the short container ID; files read with CAP_DAC_READ_SEARCH. The release workflow publishes config/docker.yaml as the `docker.yaml` asset.

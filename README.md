@@ -9,10 +9,19 @@ curl -fsSL https://get.logember.com | sudo bash -s -- --token <ENROLLMENT_TOKEN>
 ## What it does
 
 1. On the first install, `install.sh` exchanges the one-time enrollment token for a per-host ingest key (`POST /v1/enroll`), stored as `LOGEMBER_INGEST_KEY` in `/etc/logember/agent.env` (mode 600, read by systemd as the unit's `EnvironmentFile`). Re-running the script upgrades the agent and keeps the key; `--help` lists the options.
-2. It tails `journald`, `/var/log/*.log`, `/var/log/nginx/*.log` and Docker containers (when `/var/run/docker.sock` exists). Files that rsyslog copies from journald (`/var/log/syslog`, `auth.log`, `kern.log`, ...) are skipped so nothing is sent twice. Extra paths come from the hub (`GET /v1/agent/config`, polled every 5 minutes).
-3. Each line gets `host`, `service` (systemd unit, program name, file path or container name; `unknown` if none), `env` and a `severity` (`trace`…`fatal`, from the journald priority, a JSON `level` field or the text of the line). JSON lines are unpacked into attributes (flattened, lowercase dotted keys, string values, at most 64).
+2. It tails `journald`, `/var/log/*.log`, `/var/log/nginx/*.log` and Docker containers (see [Docker](#docker)). Files that rsyslog copies from journald (`/var/log/syslog`, `auth.log`, `kern.log`, ...) are skipped so nothing is sent twice. Extra paths come from the hub (`GET /v1/agent/config`, polled every 5 minutes).
+3. Each line gets `host`, `service` (systemd unit, program name, file path, container name or short container ID; `unknown` if none), `env` and a `severity` (`trace`…`fatal`, from the journald priority, a JSON `level` field or the text of the line). JSON lines are unpacked into attributes (flattened, lowercase dotted keys, string values, at most 64).
 4. Secrets are redacted on the host, before anything leaves it, in the log line and in every attribute: `Authorization` headers and bearer tokens, `password=…`, `api_key: …`, `"token":"…"` and similar (the key stays, the value becomes `****`), attributes named like a secret, AWS access key IDs, card numbers, email addresses, plus your own rules (see [Redaction](#redaction)).
 5. Lines are batched (1 MB or 5 s) and sent over OTLP/HTTP with zstd to `https://ingest.logember.com/v1/logs`. If the network is down they are buffered on disk and retried with backoff.
+
+## Docker
+
+Container logs are read from the files of Docker's default `json-file` log driver, `/var/lib/docker/containers/<id>/<id>-json.log`. Each line is unpacked: the body is the line the container wrote, `stream` (`stdout`/`stderr`) becomes an attribute, the time comes from Docker, and JSON lines and severities are handled like any other source. Lines longer than 16 KiB, which Docker splits, are joined again.
+
+- **Service name.** The log files do not name their container, so the agent asks the Docker API: when `/run/docker.sock` exists and the `logember` user may use it, the unit also loads `config/docker.yaml` (`docker_observer` + `receiver_creator`), and `service` is the container name, with `container.name` and `container.image.name` as attributes. Otherwise `service` is the short container ID. `install.sh` adds `logember` to the `docker` group when it exists; if you install Docker after the agent, re-run `install.sh` to get container names. Note that access to the Docker socket is root-equivalent; leave `logember` out of the `docker` group if you prefer container IDs over names.
+- **File permissions.** `/var/lib/docker/containers` is `root` 0710 and the log files are `root` 0640, so no group can read them. The unit gives the agent `CAP_DAC_READ_SEARCH` (read and list any file, no write access, no other capability) and hides credential files (`/etc/shadow`, `/etc/gshadow`, `/etc/sudoers*`, `/etc/ssh`) from it, on top of `ProtectSystem=strict` and `ProtectHome=true`.
+- **Without Docker** nothing changes: the glob matches no files and `docker.yaml` is not loaded.
+- **Limits.** Lines a new container writes in the second before the agent starts following it are not read. Only the `json-file` driver under the default data root is read; `journald` and other log drivers, Kubernetes and Docker-only hosts are not covered.
 
 ## Layout
 
@@ -20,6 +29,7 @@ curl -fsSL https://get.logember.com | sudo bash -s -- --token <ENROLLMENT_TOKEN>
 install.sh            the script behind get.logember.com: detects distro/arch, downloads the release, writes config, enables the unit
 uninstall.sh          stops and removes the agent; --purge also removes its config, disk buffer and user
 config/agent.yaml     OpenTelemetry Collector pipeline (receivers → processors → otlphttp exporter)
+config/docker.yaml    overlay that names Docker containers through the Docker API (loaded when it is reachable)
 config/redaction.yaml the host's own redaction rules (/etc/logember/redaction.yaml, kept on upgrade)
 deploy/logember-agent.service   systemd unit
 scripts/build.sh      builds the collector binary with ocb (only the components in config/)

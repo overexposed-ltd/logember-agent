@@ -1,4 +1,4 @@
-# ocb manifest: only the components config/agent.yaml uses (plus debug exporter for fixture tests).
+# ocb manifest: only the components config/agent.yaml and config/docker.yaml use (plus debug exporter for fixture tests).
 # Pinned to one Collector release: core v1.69.0 / v0.163.0, contrib v0.163.0.
 # Bump every gomod line together, and OCB_VERSION in scripts/build.sh with them.
 # dist.version and dist.output_path are set by scripts/build.sh.
@@ -10,6 +10,7 @@ dist:
 receivers:
   - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/receiver/filelogreceiver v0.163.0
   - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/receiver/journaldreceiver v0.163.0
+  - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/receiver/receivercreator v0.163.0
 processors:
   - gomod: go.opentelemetry.io/collector/processor/batchprocessor v0.163.0
   - gomod: go.opentelemetry.io/collector/processor/memorylimiterprocessor v0.163.0
@@ -22,6 +23,7 @@ exporters:
 extensions:
   - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/extension/storage/filestorage v0.163.0
   - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/extension/bearertokenauthextension v0.163.0
+  - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/extension/observer/dockerobserver v0.163.0
 # Explicit so the set does not change with the ocb default: ${env:...} and file:/path configs only.
 providers:
   - gomod: go.opentelemetry.io/collector/confmap/provider/envprovider v1.69.0
