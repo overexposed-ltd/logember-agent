@@ -18,6 +18,7 @@ curl -fsSL https://get.logember.com | sudo bash -s -- --token <ENROLLMENT_TOKEN>
 
 ```
 install.sh            the script behind get.logember.com: detects distro/arch, downloads the release, writes config, enables the unit
+uninstall.sh          stops and removes the agent; --purge also removes its config, disk buffer and user
 config/agent.yaml     OpenTelemetry Collector pipeline (receivers → processors → otlphttp exporter)
 config/redaction.yaml the host's own redaction rules (/etc/logember/redaction.yaml, kept on upgrade)
 deploy/logember-agent.service   systemd unit
@@ -46,6 +47,16 @@ sudo systemctl restart logember-agent
 ```
 
 Use single quotes around each rule and write a literal `$` as `$$`. Card numbers are recognized by issuer prefix and length, without a Luhn check; Unix timestamps and snowflake IDs (which start with 1) are not touched.
+
+## Uninstall
+
+```bash
+curl -fsSL https://github.com/overexposed-ltd/logember-agent/releases/latest/download/uninstall.sh | sudo bash
+```
+
+This stops and disables the unit and removes `/usr/local/bin/logember-agent` and the unit file. `/etc/logember` (config, your redaction rules, the ingest key) and `/var/lib/logember` (the disk buffer) are kept, so installing again picks up where it left off. Add `-s -- --purge` to remove them and the `logember` user as well. Running it again is harmless.
+
+The script does not revoke the ingest key: remove the host in the hub to do that.
 
 ## Supported platforms
 
