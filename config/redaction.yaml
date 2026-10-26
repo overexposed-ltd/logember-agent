@@ -1,0 +1,5 @@
+# Extra redaction rules merged into processors.redaction.blocked_values by install.sh / the config poller.
+# One regex per line under `rules:`. Rules from the hub (project settings → Redaction) are appended at runtime.
+rules:
+  - '(?i)authorization:\s*\S+'
+  - '\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b'   # emails; disable in the hub if you need them

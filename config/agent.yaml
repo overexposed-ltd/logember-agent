@@ -1,0 +1,88 @@
+# LogEmber agent: OpenTelemetry Collector pipeline.
+# Values in ${env:...} are written by install.sh into /etc/logember/agent.env.
+receivers:
+  journald:
+    directory: /var/log/journal
+    priority: info
+  filelog:
+    include:
+      - /var/log/*.log
+      - /var/log/nginx/*.log
+      - /var/log/syslog
+    exclude:
+      - /var/log/logember-agent.log
+    start_at: end
+    storage: file_storage
+    include_file_path: true
+    operators:
+      - type: json_parser
+        if: 'body matches "^\\s*\\{"'
+        parse_from: body
+        timestamp:
+          parse_from: attributes.time
+          layout_type: gotime
+          layout: '2006-01-02T15:04:05.000Z07:00'
+        severity:
+          parse_from: attributes.level
+  docker_stats: {}  # placeholder; container logs come via filelog on /var/lib/docker/containers/*/*.log
+
+processors:
+  memory_limiter:
+    check_interval: 5s
+    limit_mib: 256
+  resourcedetection:
+    detectors: [system]
+    system: { hostname_sources: [os] }
+  transform/service:
+    log_statements:
+      - context: log
+        statements:
+          # service from the file path: /var/log/nginx/access.log -> nginx
+          - set(attributes["logember.service"], "journald") where attributes["log.file.path"] == nil
+          - set(attributes["logember.service"], Split(attributes["log.file.path"], "/")[3]) where attributes["log.file.path"] != nil and IsMatch(attributes["log.file.path"], "^/var/log/[^/]+/")
+          - set(attributes["logember.service"], "system") where attributes["logember.service"] == nil
+          - set(attributes["logember.env"], "${env:LOGEMBER_ENV}")
+  redaction:
+    allow_all_keys: true
+    blocked_values:
+      - 'Bearer [A-Za-z0-9\-_\.=]{16,}'
+      - '(?i)(password|passwd|pwd|secret|api[_-]?key|token)\s*[=:]\s*\S+'
+      - 'AKIA[0-9A-Z]{16}'
+      - '\b(?:\d[ -]*?){13,19}\b'
+    summary: silent
+  batch:
+    send_batch_size: 8192
+    send_batch_max_size: 16384
+    timeout: 5s
+
+extensions:
+  file_storage:
+    directory: /var/lib/logember/buffer
+    timeout: 10s
+  bearertokenauth:
+    token: "${env:LOGEMBER_INGEST_KEY}"
+
+exporters:
+  otlphttp:
+    endpoint: "${env:LOGEMBER_INGEST_URL}"   # https://ingest.logember.com
+    compression: zstd
+    auth: { authenticator: bearertokenauth }
+    sending_queue:
+      enabled: true
+      storage: file_storage
+      queue_size: 5000
+    retry_on_failure:
+      enabled: true
+      initial_interval: 5s
+      max_interval: 60s
+      max_elapsed_time: 0   # never drop; the disk queue bounds it
+
+service:
+  extensions: [file_storage, bearertokenauth]
+  pipelines:
+    logs:
+      receivers: [journald, filelog]
+      processors: [memory_limiter, resourcedetection, transform/service, redaction, batch]
+      exporters: [otlphttp]
+  telemetry:
+    logs: { level: warn }

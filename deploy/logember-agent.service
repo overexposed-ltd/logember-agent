@@ -1,0 +1,24 @@
+[Unit]
+Description=LogEmber agent (OpenTelemetry Collector)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=logember
+Group=logember
+SupplementaryGroups=systemd-journal adm docker
+EnvironmentFile=/etc/logember/agent.env
+ExecStart=/usr/local/bin/logember-agent --config /etc/logember/agent.yaml
+Restart=always
+RestartSec=5
+LimitNOFILE=65536
+MemoryMax=512M
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/logember
+StateDirectory=logember
+
+[Install]
+WantedBy=multi-user.target
