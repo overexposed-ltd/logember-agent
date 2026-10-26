@@ -2,3 +2,4 @@
 dist/
 *.log
 .tools/
+!test/fixtures/**/*.log
