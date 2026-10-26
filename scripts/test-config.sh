@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Runs the built agent with config/agent.yaml against the fixtures in test/fixtures and checks
-# every record it sends against the record schema (proto/log-schema.json in the main repo).
+# Runs the built agent with config/agent.yaml and config/redaction.yaml (as the unit does) against
+# the fixtures in test/fixtures and checks every record it sends against the record schema
+# (proto/log-schema.json in the main repo), and that no secret from the redaction fixtures leaves it.
 #
 # The agent runs in a throwaway Debian 12 container: the fixtures are copied into the real
 # /var/log there (so the include/exclude paths of agent.yaml are tested as they are), the journal
@@ -36,6 +37,7 @@ records="$TEST_WORK/records.jsonl"
 
 echo "== validate"
 "$bin" validate --config config/agent.yaml
+"$bin" validate --config config/agent.yaml --config config/redaction.yaml
 
 echo "== fixtures"
 # the image's own apt/dpkg logs would be read too: start from an empty /var/log
@@ -54,7 +56,7 @@ expected=$((expected_files + expected_journal))
 echo "== run (expecting $expected records)"
 python3 test/otlp-sink.py 4318 "$out" "$LOGEMBER_INGEST_KEY" &
 sink=$!
-"$bin" --config config/agent.yaml --config test/agent.test.yaml >"$TEST_WORK/agent.log" 2>&1 &
+"$bin" --config config/agent.yaml --config config/redaction.yaml --config test/agent.test.yaml >"$TEST_WORK/agent.log" 2>&1 &
 agent=$!
 trap 'kill $agent $sink 2>/dev/null || true' EXIT
 
@@ -144,9 +146,50 @@ check "journald nginx.service -> nginx, PRIORITY 3 -> error" "$(rec 'contains("b
 check "journald ssh.service -> ssh, info" "$(rec 'contains("Accepted publickey for deploy")') | .attrs[\"logember.service\"] == \"ssh\" and .severity_text == \"info\""
 check "journald kernel (no unit) -> identifier, PRIORITY 4 -> warn" "$(rec 'startswith("EXT4-fs")') | .attrs[\"logember.service\"] == \"kernel\" and .severity_text == \"warn\""
 check "journald session scope -> identifier, notice -> info" "$(rec 'contains("COMMAND=/usr/bin/systemctl")') | .attrs[\"logember.service\"] == \"sudo\" and .severity_text == \"info\""
-check "journald template unit postgresql@16-main.service -> postgresql" "$(rec 'contains("orders_archive")') | .attrs[\"logember.service\"] == \"postgresql\" and .severity_text == \"error\""
+check "journald template unit postgresql@16-main.service -> postgresql" "$(rec 'contains("orders_archive")') | .attrs[\"logember.service\"] == \"postgresql\" and .severity_text == \"error\" and .attrs[\"systemd.unit\"] == \"postgresql@16-main.service\""
 check "journald nothing derivable -> unknown, PRIORITY 0 -> fatal" "$(rec 'contains("without unit")') | .attrs[\"logember.service\"] == \"unknown\" and .severity_text == \"fatal\""
 check "journald debug entry dropped by the priority filter" 'all(.body | contains("below the info priority") | not)'
+
+# Redaction: none of these raw values may appear anywhere in what was sent (bodies, attributes).
+secrets=(
+  eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyLTQyIn0.c2lnbmF0dXJlLXNlY3JldA # bearer token
+  dXNlcjpodW50ZXIy                                                   # basic auth
+  hunter2                                                            # password=
+  sk_live_51HxQe2KZvq8Rk3pTn9                                        # api_key:
+  AKIAABCDEFGHIJKLMNOP                                               # AWS access key ID
+  "4111 1111 1111 1111" 4111-1111-1111-1111 4111111111111111 "3782 822463 10005"
+  jane.doe@example.com                                               # email (config/redaction.yaml)
+  Zt9fQw2mX8pL4rB7aQ                                                 # ?token= in an access log
+)
+for secret in "${secrets[@]}"; do
+  if grep -qF -- "$secret" "$out"; then
+    echo "FAIL redaction: $secret was sent"
+    fail=1
+  else
+    echo "ok   redaction: $secret not sent"
+  fi
+done
+check "redaction keeps the key: Authorization: Bearer ****" "$(rec 'startswith("INFO calling billing")') | .body == \"INFO calling billing with Authorization: Bearer ****\""
+check "redaction keeps the key: Authorization: Basic ****" "$(rec 'startswith("curl -H")') | .body == \"curl -H \\\"Authorization: Basic ****\\\" https://api.example.com/v1/charges\""
+check "redaction keeps the key: password=****" "$(rec 'contains("login failed for admin")') | .body == \"WARN login failed for admin password=**** from 203.0.113.7\" and .severity_text == \"warn\""
+check "redaction keeps the key: api_key: ****" "$(rec 'startswith("loaded settings")') | .body == \"loaded settings api_key: **** region=eu-west-1\""
+check "redaction: AWS access key ID -> ****" "$(rec 'startswith("uploading backups")') | .body == \"uploading backups with AWS key ****\""
+check "redaction: card numbers with spaces, dashes, none, Amex grouping" "$(rec 'startswith("retried card")') | .body == \"retried card ****, then ****, then amex ****\""
+check "redaction: email via config/redaction.yaml" "$(rec 'startswith("password reset mail")') | .body == \"password reset mail sent to ****\""
+check "redaction: ?token= in the body and in url.path" "$(rec 'contains("GET /reset")') | (.body | contains(\"/reset?token=**** HTTP\")) and .attrs[\"url.path\"] == \"/reset?token=****\""
+check "redaction: JSON line body keeps its structure" "$(rec 'contains("outgoing request")') | .body == \"{\\\"level\\\":\\\"info\\\",\\\"msg\\\":\\\"outgoing request\\\",\\\"headers\\\":{\\\"Authorization\\\":\\\"Bearer ****\\\"},\\\"user\\\":{\\\"email\\\":\\\"****\\\",\\\"password\\\":\\\"****\\\"},\\\"api_key\\\":\\\"****\\\",\\\"aws_access_key_id\\\":\\\"****\\\",\\\"card\\\":\\\"****\\\",\\\"note\\\":\\\"retry with password=****\\\"}\""
+check "redaction: JSON fields as attributes" "$(rec 'contains("outgoing request")') | .attrs.msg == \"outgoing request\" and .attrs[\"headers.authorization\"] == \"****\" and .attrs[\"user.password\"] == \"****\" and .attrs[\"user.email\"] == \"****\" and .attrs.api_key == \"****\" and .attrs.aws_access_key_id == \"****\" and .attrs.card == \"****\" and .attrs.note == \"retry with password=****\""
+# ...and lines that only look like secrets pass through unchanged.
+while IFS= read -r line; do
+  if jq -se --arg line "$line" 'map(select(.body == $line)) | length == 1' "$records" >/dev/null; then
+    echo "ok   unchanged: ${line:0:60}"
+  else
+    echo "FAIL changed: $line"
+    fail=1
+  fi
+done <test/fixtures/var/log/redaction-clean.log
+check "unchanged: timestamp and request id in url.path" "$(rec 'contains("/api/invoices/1793016013123")') | .attrs[\"url.path\"] == \"/api/invoices/1793016013123?trace=4821-1793016000123\""
+check "unchanged: JSON ms timestamp, trace id, UUID, max_tokens" "$(rec 'contains("\"completion\"")') | .attrs.sent_at_ms == \"1793016013123\" and .attrs.trace_id == \"4bf92f3577b34da6a3ce929d0e0e4736\" and .attrs.request_id == \"8f14e45f-ceea-4672-9123-456789012345\" and .attrs.max_tokens == \"4096\" and .attrs.tokens_used == \"1200\""
 
 if (( fail )); then
   echo "-- agent log"; cat "$TEST_WORK/agent.log"

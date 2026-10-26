@@ -1,5 +1,24 @@
-# Extra redaction rules merged into processors.redaction.blocked_values by install.sh / the config poller.
-# One regex per line under `rules:`. Rules from the hub (project settings → Redaction) are appended at runtime.
-rules:
-  - '(?i)authorization:\s*\S+'
-  - '\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b'   # emails; disable in the hub if you need them
+# This host's own redaction rules, on top of the built-in ones in agent.yaml (bearer tokens,
+# Authorization headers, password/secret/token/*_key values, AWS access key IDs, card numbers).
+#
+# Installed as /etc/logember/redaction.yaml. install.sh writes it on the first install only and
+# never overwrites it, so your edits survive upgrades. The agent reads it as a second --config
+# file after /etc/logember/agent.yaml; only processors.redaction/local belongs here.
+#
+# Each rule is a regular expression (Go RE2 syntax: https://github.com/google/re2/wiki/Syntax).
+# Every match, in the log line and in every attribute value, is replaced with **** before the
+# line leaves the host. Put each rule in single quotes; write a literal $ as $$.
+#
+# To add a rule: append a line under blocked_values, check the config and restart the agent:
+#   sudo bash -c 'set -a; . /etc/logember/agent.env; logember-agent validate \
+#     --config /etc/logember/agent.yaml --config /etc/logember/redaction.yaml'
+#   sudo systemctl restart logember-agent
+processors:
+  redaction/local:
+    blocked_values:
+      # Email addresses; delete this line to keep them. The top-level domain is limited to 6
+      # letters so systemd template units (user@1000.service, getty@tty1.service) are not matched.
+      - '\b[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,6}\b'
+      # examples:
+      # - '\bcus_[A-Za-z0-9]{14}\b'          # Stripe customer IDs
+      # - '\b\d{3}-\d{2}-\d{4}\b'            # US social security numbers

@@ -1,0 +1,6 @@
+job 42 finished at 1793016013123 after 1234 ms, next run 1793016073123
+processing order 8f14e45f-ceea-4672-9123-456789012345 for tenant 0d4c3b2a-1111-4222-8333-944455556666
+203.0.113.10 - - [26/Oct/2026:12:01:01 +0000] "GET /api/invoices/1793016013123?trace=4821-1793016000123 HTTP/1.1" 200 512 "-" "curl/8.5.0" request_id=7f3a9c2e4b1d4e8f9a0b1c2d3e4f5a6b
+{"level":"info","msg":"completion","sent_at_ms":"1793016013123","trace_id":"4bf92f3577b34da6a3ce929d0e0e4736","request_id":"8f14e45f-ceea-4672-9123-456789012345","max_tokens":4096,"tokens_used":1200}
+Started user@1000.service - User Manager for UID 1000.
+Finished modprobe@drm.service - Load Kernel Module drm.

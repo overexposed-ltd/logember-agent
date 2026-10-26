@@ -6,10 +6,11 @@
 # Downloads the release assets, verifies every one against the release's checksums.txt
 # before anything is written, enrolls the host with the hub (once) and starts the
 # systemd unit. Safe to re-run: upgrades the binary, agent.yaml and the unit, and keeps
-# the existing ingest key unless --reenroll is given. See --help for all options.
+# the existing ingest key unless --reenroll is given. redaction.yaml (the host's own
+# redaction rules) is written once and never overwritten. See --help for all options.
 #
 # Release assets used: checksums.txt, logember-agent_linux_{amd64,arm64}, agent.yaml,
-# logember-agent.service. Everything runs from main() on the last line, so a download
+# redaction.yaml, logember-agent.service. Everything runs from main() on the last line, so a download
 # cut short by the network runs nothing.
 
 # This check must stay POSIX: `sh` on Debian/Ubuntu is dash, which stops here.
@@ -67,6 +68,8 @@ Options:
 Re-running the script upgrades the binary, /etc/logember/agent.yaml and the systemd unit,
 then restarts the agent. The ingest key in /etc/logember/agent.env is kept unless
 --reenroll is given; --hub, --ingest and --env default to the values already there.
+/etc/logember/redaction.yaml holds this host's own redaction rules: it is written on the
+first install only, so edits to it are kept.
 
 Environment (tests only):
   LOGEMBER_RELEASE_BASE  replaces https://github.com/overexposed-ltd/logember-agent/releases;
@@ -225,7 +228,7 @@ download_release() {
     ASSET_URL=$base/download/$VERSION
   fi
 
-  local asset assets=("logember-agent_linux_$ARCH" agent.yaml logember-agent.service)
+  local asset assets=("logember-agent_linux_$ARCH" agent.yaml redaction.yaml logember-agent.service)
   info "Downloading logember-agent $VERSION (linux/$ARCH) from $ASSET_URL"
   download checksums.txt
   for asset in "${assets[@]}"; do
@@ -259,6 +262,10 @@ install_files() {
 
   put "$TMP/logember-agent_linux_$ARCH" "$BIN" 0755 root
   put "$TMP/agent.yaml" "$CONF_DIR/agent.yaml" 0640 "$AGENT_USER"
+  # The host's own rules (the unit's second --config): only written if missing, never replaced.
+  if [[ ! -f $CONF_DIR/redaction.yaml ]]; then
+    put "$TMP/redaction.yaml" "$CONF_DIR/redaction.yaml" 0640 "$AGENT_USER"
+  fi
   put "$TMP/logember-agent.service" "$UNIT_FILE" 0644 root
 
   # The binary prints "logember-agent version 0.1.0".

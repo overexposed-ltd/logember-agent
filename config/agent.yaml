@@ -162,13 +162,60 @@ processors:
           - 'stringify_all(attributes)'
           - 'truncate_all(attributes, 2048)'
           - 'limit(attributes, 64, ["logember.service", "logember.env", "log.file.path"])'
+  # Secrets are removed here, on the host, after the line has been mapped onto the schema, so
+  # the body and every attribute derived from it (JSON fields, url.path, ...) are covered.
+  # Three steps, all stock components:
+  #   transform/redact  key=value style secrets, in the body and in every attribute value. The
+  #                     key stays, the value becomes ****: "password=****", "Authorization:
+  #                     Bearer ****", {"api_key":"****"}. (redactionprocessor would replace the
+  #                     whole match, key included, since it has no capture groups.)
+  #   redaction         attributes whose key names a secret (a JSON field "password", ...),
+  #                     and values recognizable on their own: AWS access key IDs, card numbers.
+  #   redaction/local   the host's own rules from /etc/logember/redaction.yaml (see that file).
+  # redactionprocessor v0.163.0 applies blocked_values to string bodies as well as attributes.
+  transform/redact:
+    error_mode: silent
+    log_statements:
+      - context: log
+        statements:
+          # Authorization headers: "Authorization: Bearer <token>", "authorization=<token>", JSON "Authorization":"Basic <...>"
+          - 'replace_pattern(body, "(?i)(authorization[\"\\x27]?\\s*[=:]\\s*[\"\\x27]?(?:(?:bearer|basic|digest|token|negotiate)\\s+)?)[^\\s\"\\x27,;}]+", "$$1****")'
+          - 'replace_all_patterns(attributes, "value", "(?i)(authorization[\"\\x27]?\\s*[=:]\\s*[\"\\x27]?(?:(?:bearer|basic|digest|token|negotiate)\\s+)?)[^\\s\"\\x27,;}]+", "$$1****")'
+          # bearer tokens anywhere else ("Bearer" plus at least 16 token characters)
+          - 'replace_pattern(body, "(?i)(\\bbearer\\s+)[A-Za-z0-9\\-._~+/]{16,}=*", "$$1****")'
+          - 'replace_all_patterns(attributes, "value", "(?i)(\\bbearer\\s+)[A-Za-z0-9\\-._~+/]{16,}=*", "$$1****")'
+          # key=value, key: value, "key":"value", key='value' for password, secret, token, *_key names.
+          # Quoted values first (up to the closing quote, escaped quotes included), then bare ones.
+          - 'replace_pattern(body, "(?i)((?:passw(?:or)?d|passphrase|secret|token|(?:api|access|secret|private|signing|encryption)[_-]?key|apikey)\"?\\s*[=:]\\s*\")(?:[^\"\\\\]|\\\\.)*", "$$1****")'
+          - 'replace_all_patterns(attributes, "value", "(?i)((?:passw(?:or)?d|passphrase|secret|token|(?:api|access|secret|private|signing|encryption)[_-]?key|apikey)\"?\\s*[=:]\\s*\")(?:[^\"\\\\]|\\\\.)*", "$$1****")'
+          - 'replace_pattern(body, "(?i)((?:passw(?:or)?d|passphrase|secret|token|(?:api|access|secret|private|signing|encryption)[_-]?key|apikey)[\"\\x27]?\\s*[=:]\\s*\\x27)[^\\x27]*", "$$1****")'
+          - 'replace_all_patterns(attributes, "value", "(?i)((?:passw(?:or)?d|passphrase|secret|token|(?:api|access|secret|private|signing|encryption)[_-]?key|apikey)[\"\\x27]?\\s*[=:]\\s*\\x27)[^\\x27]*", "$$1****")'
+          - 'replace_pattern(body, "(?i)((?:passw(?:or)?d|passphrase|secret|token|(?:api|access|secret|private|signing|encryption)[_-]?key|apikey)\"?\\s*[=:]\\s*)[^\\s\"\\x27,;&}\\]]+", "$$1****")'
+          - 'replace_all_patterns(attributes, "value", "(?i)((?:passw(?:or)?d|passphrase|secret|token|(?:api|access|secret|private|signing|encryption)[_-]?key|apikey)\"?\\s*[=:]\\s*)[^\\s\"\\x27,;&}\\]]+", "$$1****")'
   redaction:
     allow_all_keys: true
+    # The whole value is masked. Matched against the end of the key, so "auth.password",
+    # "client_secret" and "password.0" (a flattened JSON array) match, "max_tokens" does not.
+    blocked_key_patterns:
+      - '(?i)(passw(or)?d|passphrase|secret|token|(api|access|secret|private|signing|encryption)[_-]?key|apikey|authorization)(\.\d+)?$'
     blocked_values:
-      - 'Bearer [A-Za-z0-9\-_\.=]{16,}'
-      - '(?i)(password|passwd|pwd|secret|api[_-]?key|token)\s*[=:]\s*\S+'
-      - 'AKIA[0-9A-Z]{16}'
-      - '\b(?:\d[ -]*?){13,19}\b'
+      # AWS access key IDs (long-term AKIA, temporary ASIA)
+      - '\b(?:AKIA|ASIA)[0-9A-Z]{16}\b'
+      # Card numbers by issuer prefix and length, no Luhn check: Visa 4 (16/19 digits),
+      # Mastercard 51-55 and 22-27, Amex 34/37 (15), Diners 30/36/38 (14), JCB 35, Discover/UnionPay 6.
+      # Unix timestamps in ms/ns and snowflake IDs start with 1 and are not matched.
+      # Unbroken digits:
+      - '\b(?:4\d{15}(?:\d{3})?|5[1-5]\d{14}|2[2-7]\d{14}|3[47]\d{13}|3[0689]\d{12}|35\d{14,17}|6\d{15,18})\b'
+      # 4-4-4-4 groups (plus up to 3 digits), separated by a space or a dash:
+      - '\b(?:4\d{3}|5[1-5]\d{2}|2[2-7]\d{2}|35\d{2}|6\d{3})(?:[ -]\d{4}){3}(?:[ -]\d{1,3})?\b'
+      # Amex 4-6-5 and Diners 4-6-4:
+      - '\b3[0-9]\d{2}[ -]\d{6}[ -]\d{4,5}\b'
+    summary: silent
+  # Placeholder for the rules in /etc/logember/redaction.yaml, which the unit passes as a second
+  # --config; its blocked_values replace this empty list. Keeps agent.yaml valid on its own.
+  redaction/local:
+    allow_all_keys: true
+    blocked_values: []
     summary: silent
   batch:
     send_batch_size: 8192
@@ -203,7 +250,7 @@ service:
   pipelines:
     logs:
       receivers: [journald, filelog]
-      processors: [memory_limiter, resourcedetection, transform/normalize, redaction, batch]
+      processors: [memory_limiter, resourcedetection, transform/normalize, transform/redact, redaction, redaction/local, batch]
       exporters: [otlphttp]
   telemetry:
     logs: { level: warn }
