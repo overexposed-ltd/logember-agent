@@ -24,7 +24,7 @@ fi
 set -euo pipefail
 
 REPO="overexposed-ltd/logember-agent"
-DEFAULT_HUB="https://app.logember.com"
+DEFAULT_HUB="https://api.logember.com"
 DEFAULT_INGEST="https://ingest.logember.com"
 DEFAULT_ENV="production"
 SERVICE="logember-agent"
@@ -66,7 +66,7 @@ Options:
                     Required on the first install and with --reenroll.
   --version vX.Y.Z  release to install, e.g. v0.1.0 or v0.1.0-rc.1 (default: latest,
                     the newest release that is not a pre-release)
-  --hub URL         hub URL (default: https://app.logember.com)
+  --hub URL         hub URL (default: https://api.logember.com)
   --ingest URL      ingest URL (default: https://ingest.logember.com)
   --env NAME        value of the env attribute on every log line (default: production)
   --reenroll        enroll again even if this host already has an ingest key
