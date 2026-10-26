@@ -83,6 +83,7 @@ jobs:
         run: |
           agent="dist/logember-agent_linux_$(dpkg --print-architecture)"
           "$agent" validate --config config/agent.yaml
+          "$agent" validate --config config/agent.yaml --config config/redaction.yaml
 
       # Flat asset names: install.sh downloads <base>/download/<tag>/<asset>.
       - name: Collect assets and write checksums.txt

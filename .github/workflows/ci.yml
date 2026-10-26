@@ -1,4 +1,5 @@
-# CI: build the linux binaries, shellcheck the scripts, validate config/agent.yaml.
+# CI: build the linux binaries, shellcheck the scripts, validate config/agent.yaml (alone and with
+# config/redaction.yaml, as the unit runs it).
 # Actions are pinned by commit SHA; the comment after each pin is the release tag.
 name: CI
 
@@ -115,6 +116,7 @@ jobs:
           agent="dist/logember-agent_linux_$(dpkg --print-architecture)"
           "$agent" --version
           "$agent" validate --config config/agent.yaml
+          "$agent" validate --config config/agent.yaml --config config/redaction.yaml
 
       # Runs the agent on test/fixtures in a Debian 12 container and checks every record it sends.
       - name: scripts/test-config.sh

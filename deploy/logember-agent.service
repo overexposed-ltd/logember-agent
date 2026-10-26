@@ -10,7 +10,7 @@ Group=logember
 # No SupplementaryGroups=: systemd refuses to start when a listed group is missing (e.g. no
 # docker). install.sh adds the user to systemd-journal, adm and docker where they exist.
 EnvironmentFile=/etc/logember/agent.env
-ExecStart=/usr/local/bin/logember-agent --config /etc/logember/agent.yaml
+ExecStart=/usr/local/bin/logember-agent --config /etc/logember/agent.yaml --config /etc/logember/redaction.yaml
 Restart=always
 RestartSec=5
 LimitNOFILE=65536

@@ -1,0 +1,10 @@
+INFO calling billing with Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyLTQyIn0.c2lnbmF0dXJlLXNlY3JldA
+curl -H "Authorization: Basic dXNlcjpodW50ZXIy" https://api.example.com/v1/charges
+WARN login failed for admin password=hunter2 from 203.0.113.7
+loaded settings api_key: sk_live_51HxQe2KZvq8Rk3pTn9 region=eu-west-1
+uploading backups with AWS key AKIAABCDEFGHIJKLMNOP
+charged card 4111 1111 1111 1111 amount=10.00 EUR
+retried card 4111-1111-1111-1111, then 4111111111111111, then amex 3782 822463 10005
+password reset mail sent to jane.doe@example.com
+203.0.113.10 - - [26/Oct/2026:12:01:00 +0000] "GET /reset?token=Zt9fQw2mX8pL4rB7aQ HTTP/1.1" 200 64 "-" "curl/8.5.0"
+{"level":"info","msg":"outgoing request","headers":{"Authorization":"Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyLTQyIn0.c2lnbmF0dXJlLXNlY3JldA"},"user":{"email":"jane.doe@example.com","password":"hunter2"},"api_key":"sk_live_51HxQe2KZvq8Rk3pTn9","aws_access_key_id":"AKIAABCDEFGHIJKLMNOP","card":"4111 1111 1111 1111","note":"retry with password=hunter2"}
